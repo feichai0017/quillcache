@@ -324,7 +324,7 @@ async fn filter_project_mlir_execution_materializes_fixed_width_columns() {
 }
 
 #[tokio::test]
-async fn debug_trace_reports_filter_sum_candidate() {
+async fn debug_trace_reports_plain_sum_candidate() {
     let db = Database::new_temp().expect("database");
     let schema = Arc::new(Schema::new(vec![
         Field::new("v", DataType::Int64, false),
@@ -386,7 +386,7 @@ async fn debug_trace_reports_filter_sum_candidate() {
 }
 
 #[tokio::test]
-async fn f64_filter_sum_mlir_execution_preserves_empty_sum_null() {
+async fn f64_plain_sum_mlir_execution_preserves_empty_sum_null() {
     let db = database_with_mlir_execution();
     let schema = Arc::new(Schema::new(vec![
         Field::new("v", DataType::Int64, false),
@@ -431,7 +431,7 @@ async fn f64_filter_sum_mlir_execution_preserves_empty_sum_null() {
 }
 
 #[tokio::test]
-async fn parquet_q6_shape_uses_decimal_filter_sum_candidate() {
+async fn parquet_q6_shape_uses_decimal_plain_sum_candidate() {
     let dir = TempDir::new().expect("temp dir");
     let parquet_path = dir.path().join("lineitem.parquet");
     write_q6_lineitem_parquet(parquet_path.to_str().unwrap()).await;

@@ -1,4 +1,4 @@
-use crate::{AggregateFunc, FixedColumnInput, GroupAggregate};
+use crate::{AggregateFunc, FilterSumValue, FixedColumnInput, GroupAggregate};
 use crate::{
     JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType, MlirBackend, PipelineGraph,
     PipelineKind, PipelineStage,
@@ -85,9 +85,9 @@ fn emits_q6_quill_dialect_pipeline_spec() {
 
     assert_eq!(
         module.pipeline_spec().map(|spec| spec.name()),
-        Some("decimal_filter_sum")
+        Some("plain_sum")
     );
-    assert!(text.contains("// qjit.pipeline = decimal_filter_sum"));
+    assert!(text.contains("// qjit.pipeline = plain_sum"));
     assert!(text.contains("quill.sink.plain_sum"));
     assert!(!text.contains("measure ="));
 }
@@ -243,14 +243,14 @@ fn emits_record_pipeline_module() {
 }
 
 #[test]
-fn emits_f64_filter_sum_module() {
+fn emits_f64_plain_sum_module() {
     let predicate = i64_gt_ten(false);
     let measure = f64_product_measure();
 
     let module = MlirBackend::new()
-        .lower_f64_filter_sum(&predicate, &measure)
+        .lower_plain_sum(&predicate, &measure)
         .unwrap();
-    assert!(module.text.contains("func.func @quill_f64_filter_sum_"));
+    assert!(module.text.contains("func.func @quill_plain_sum_"));
     assert!(module.text.contains("llvm.emit_c_interface"));
     assert!(!module.text.contains("quill."));
     assert!(module.text.contains("scf.for"));
@@ -262,15 +262,15 @@ fn emits_f64_filter_sum_module() {
 }
 
 #[test]
-fn emits_decimal_filter_sum_module() {
+fn emits_decimal_plain_sum_module() {
     let predicate = q6_decimal_predicate();
     let measure = q6_decimal_measure();
 
     let module = MlirBackend::new()
-        .lower_decimal_filter_sum(&predicate, &measure)
+        .lower_plain_sum(&predicate, &measure)
         .unwrap();
 
-    assert!(module.text.contains("func.func @quill_decimal_filter_sum_"));
+    assert!(module.text.contains("func.func @quill_plain_sum_"));
     assert!(module.text.contains("llvm.emit_c_interface"));
     assert!(module.text.contains("scf.for"));
     assert!(!module.text.contains("quill."));
@@ -384,11 +384,11 @@ fn invokes_compiled_record_pipeline_kernel() {
 }
 
 #[test]
-fn invokes_compiled_f64_filter_sum_kernel() {
+fn invokes_compiled_f64_plain_sum_kernel() {
     let predicate = i64_gt_ten(false);
     let measure = f64_product_measure();
     let compiled = MlirBackend::new()
-        .compile_f64_filter_sum(&predicate, &measure)
+        .compile_plain_sum(&predicate, &measure)
         .unwrap();
     let predicate_values = [9_i64, 11, 12];
     let left_values = [10.0_f64, 20.0, 30.0];
@@ -411,16 +411,73 @@ fn invokes_compiled_f64_filter_sum_kernel() {
         ])
         .unwrap();
 
-    assert!((output.sum - 13.0).abs() < 0.000_001);
-    assert_eq!(output.count, 2);
+    assert!(matches!(
+        output,
+        FilterSumValue::Float64(Some(value)) if (value - 13.0).abs() < 0.000_001
+    ));
 }
 
 #[test]
-fn invokes_compiled_decimal_filter_sum_kernel() {
+fn invokes_compiled_f64_plain_sum_with_or_predicate() {
+    let predicate = or(
+        compare(
+            JitBinaryOp::Lt,
+            JitExpr::Column {
+                index: 0,
+                name: "a".to_string(),
+                ty: JitType::Int64,
+                nullable: false,
+            },
+            JitExpr::Literal(JitScalar::Int64(10)),
+        ),
+        compare(
+            JitBinaryOp::Gt,
+            JitExpr::Column {
+                index: 0,
+                name: "a".to_string(),
+                ty: JitType::Int64,
+                nullable: false,
+            },
+            JitExpr::Literal(JitScalar::Int64(11)),
+        ),
+    );
+    let measure = f64_product_measure();
+    let compiled = MlirBackend::new()
+        .compile_plain_sum(&predicate, &measure)
+        .unwrap();
+    let predicate_values = [9_i64, 10, 12];
+    let left_values = [10.0_f64, 20.0, 30.0];
+    let right_values = [0.1_f64, 0.2, 0.3];
+
+    let output = compiled
+        .invoke(&[
+            crate::FixedColumnInput::Int64 {
+                index: 0,
+                values: &predicate_values,
+            },
+            crate::FixedColumnInput::Float64 {
+                index: 1,
+                values: &left_values,
+            },
+            crate::FixedColumnInput::Float64 {
+                index: 2,
+                values: &right_values,
+            },
+        ])
+        .unwrap();
+
+    assert!(matches!(
+        output,
+        FilterSumValue::Float64(Some(value)) if (value - 10.0).abs() < 0.000_001
+    ));
+}
+
+#[test]
+fn invokes_compiled_decimal_plain_sum_kernel() {
     let predicate = q6_decimal_predicate();
     let measure = q6_decimal_measure();
     let compiled = MlirBackend::new()
-        .compile_decimal_filter_sum(&predicate, &measure)
+        .compile_plain_sum(&predicate, &measure)
         .unwrap();
     let shipdates = [9_i32, 10, 12, 20];
     let prices = [10_000_i128, 20_000, 30_000, 40_000];
@@ -448,8 +505,13 @@ fn invokes_compiled_decimal_filter_sum_kernel() {
         ])
         .unwrap();
 
-    assert_eq!(output.sum, 210_000);
-    assert_eq!(output.count, 1);
+    assert_eq!(
+        output,
+        FilterSumValue::Decimal128 {
+            value: Some(210_000),
+            scale: 4
+        }
+    );
 }
 
 fn i64_gt_ten(nullable: bool) -> JitExpr {
@@ -549,6 +611,16 @@ fn q6_decimal_measure() -> JitExpr {
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {
     JitExpr::Binary {
         op: JitBinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+        ty: JitType::Bool,
+        nullable: false,
+    }
+}
+
+fn or(left: JitExpr, right: JitExpr) -> JitExpr {
+    JitExpr::Binary {
+        op: JitBinaryOp::Or,
         left: Box::new(left),
         right: Box::new(right),
         ty: JitType::Bool,

@@ -7,9 +7,8 @@ pub use dialect::{QuillDialectModule, QuillDialectOp, QuillDialectSink, QuillDia
 pub use frontend::{CompiledPipeline, FrontendAdapter};
 pub use lower::{JitOptions, PipelineLowering};
 pub use mlir::{
-    CompiledDecimalFilterSum, CompiledF64FilterSum, CompiledI64Filter, CompiledRecordPipeline,
-    DecimalFilterSumOutput, F64FilterSumOutput, FixedColumnInput, MlirBackend, MlirColumn,
-    MlirModule, RecordPipelineOutput,
+    CompiledI64Filter, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput, MlirBackend,
+    MlirColumn, MlirModule, RecordPipelineOutput,
 };
 pub use quill_plan::{
     AggregateFunc, GroupAggregate, JitBinaryOp, JitError, JitExpr, JitProjection, JitResult,
@@ -17,7 +16,7 @@ pub use quill_plan::{
 };
 pub use quill_runtime::{
     CompiledKernel, FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn,
-    KernelBackend, KernelKind, PipelineSpec, PredicateSpec,
+    KernelBackend, KernelKind, PipelineSpec,
 };
 
 pub use mlir::{execute_filter_project, execute_filter_sum};

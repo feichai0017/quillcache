@@ -132,16 +132,7 @@ impl<'a> PipelineCompiler<'a> {
                 .cloned()
                 .unwrap_or_else(|| PipelineSpec::generic(KernelKind::FilterSum))
         };
-        if let Ok(module) = self.backend.lower_f64_filter_sum(predicate, measure) {
-            return CompiledKernel::with_spec(
-                module.symbol,
-                spec(),
-                self.backend.name(),
-                self.options.mlir_execution_enabled(),
-            );
-        }
-
-        if let Ok(module) = self.backend.lower_decimal_filter_sum(predicate, measure) {
+        if let Ok(module) = self.backend.lower_plain_sum(predicate, measure) {
             return CompiledKernel::with_spec(
                 module.symbol,
                 spec(),

@@ -1,4 +1,4 @@
-use crate::{JitError, JitResult, JitType, MlirColumn, MlirModule};
+use crate::{FilterSumValue, JitError, JitResult, JitType, MlirColumn, MlirModule};
 
 use melior::{ir::Module, pass, ExecutionEngine};
 
@@ -19,28 +19,11 @@ pub struct CompiledRecordPipeline {
     output_types: Vec<JitType>,
 }
 
-pub struct CompiledF64FilterSum {
+pub struct CompiledPlainSum {
     symbol: String,
     engine: ExecutionEngine,
     columns: Vec<MlirColumn>,
-}
-
-pub struct CompiledDecimalFilterSum {
-    symbol: String,
-    engine: ExecutionEngine,
-    columns: Vec<MlirColumn>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct F64FilterSumOutput {
-    pub sum: f64,
-    pub count: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecimalFilterSumOutput {
-    pub sum: i128,
-    pub count: i64,
+    output_type: JitType,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,31 +199,39 @@ impl CompiledRecordPipeline {
     }
 }
 
-impl CompiledF64FilterSum {
-    pub fn invoke(&self, inputs: &[FixedColumnInput<'_>]) -> JitResult<F64FilterSumOutput> {
-        let mut output_sum = 0.0_f64;
-        let output_sum_ptr = &mut output_sum as *mut f64;
-        let mut output_count = 0_i64;
-        let mut output_count_ptr = &mut output_count as *mut i64;
-        invoke_plain_sum(
-            &self.engine,
-            &self.symbol,
-            &self.columns,
-            inputs,
-            output_sum_ptr.cast(),
-            &mut output_count_ptr,
-        )?;
-        Ok(F64FilterSumOutput {
-            sum: output_sum,
-            count: output_count,
+impl CompiledPlainSum {
+    pub fn invoke(&self, inputs: &[FixedColumnInput<'_>]) -> JitResult<FilterSumValue> {
+        match self.output_type {
+            JitType::Float64 => self.invoke_f64(inputs),
+            JitType::Decimal128 { scale, .. } => self.invoke_decimal(inputs, scale),
+            other => Err(JitError::Backend(format!(
+                "compiled plain SUM output type {other:?} is not supported"
+            ))),
+        }
+    }
+
+    fn invoke_f64(&self, inputs: &[FixedColumnInput<'_>]) -> JitResult<FilterSumValue> {
+        let mut sum = 0.0_f64;
+        let sum_ptr = &mut sum as *mut f64;
+        let count = self.invoke_raw(inputs, sum_ptr.cast())?;
+        Ok(FilterSumValue::Float64((count > 0).then_some(sum)))
+    }
+
+    fn invoke_decimal(
+        &self,
+        inputs: &[FixedColumnInput<'_>],
+        scale: i8,
+    ) -> JitResult<FilterSumValue> {
+        let mut sum = 0_i128;
+        let sum_ptr = &mut sum as *mut i128;
+        let count = self.invoke_raw(inputs, sum_ptr.cast())?;
+        Ok(FilterSumValue::Decimal128 {
+            value: (count > 0).then_some(sum),
+            scale,
         })
     }
-}
 
-impl CompiledDecimalFilterSum {
-    pub fn invoke(&self, inputs: &[FixedColumnInput<'_>]) -> JitResult<DecimalFilterSumOutput> {
-        let mut output_sum = 0_i128;
-        let output_sum_ptr = &mut output_sum as *mut i128;
+    fn invoke_raw(&self, inputs: &[FixedColumnInput<'_>], output_sum: *mut ()) -> JitResult<i64> {
         let mut output_count = 0_i64;
         let mut output_count_ptr = &mut output_count as *mut i64;
         invoke_plain_sum(
@@ -248,13 +239,10 @@ impl CompiledDecimalFilterSum {
             &self.symbol,
             &self.columns,
             inputs,
-            output_sum_ptr.cast(),
+            output_sum,
             &mut output_count_ptr,
         )?;
-        Ok(DecimalFilterSumOutput {
-            sum: output_sum,
-            count: output_count,
-        })
+        Ok(output_count)
     }
 }
 
@@ -427,25 +415,16 @@ pub fn compile_record_pipeline(
     })
 }
 
-pub fn compile_f64_filter_sum(
+pub fn compile_plain_sum(
     compiled: &MlirModule,
     columns: Vec<MlirColumn>,
-) -> JitResult<CompiledF64FilterSum> {
-    Ok(CompiledF64FilterSum {
+    output_type: JitType,
+) -> JitResult<CompiledPlainSum> {
+    Ok(CompiledPlainSum {
         symbol: compiled.symbol.clone(),
         engine: compile_engine(compiled)?,
         columns,
-    })
-}
-
-pub fn compile_decimal_filter_sum(
-    compiled: &MlirModule,
-    columns: Vec<MlirColumn>,
-) -> JitResult<CompiledDecimalFilterSum> {
-    Ok(CompiledDecimalFilterSum {
-        symbol: compiled.symbol.clone(),
-        engine: compile_engine(compiled)?,
-        columns,
+        output_type,
     })
 }
 

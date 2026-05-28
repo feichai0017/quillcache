@@ -9,17 +9,15 @@ use quill_plan::{JitError, JitResult};
 type Result<T> = JitResult<T>;
 
 use crate::{
-    CompiledDecimalFilterSum, CompiledF64FilterSum, CompiledKernel, CompiledRecordPipeline,
-    FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumnInput, JitType, MlirBackend,
-    MlirColumn, PipelineSpec, PredicateSpec, RecordPipelineOutput,
+    CompiledKernel, CompiledPlainSum, CompiledRecordPipeline, FilterProjectKernel, FilterSumKernel,
+    FilterSumValue, FixedColumnInput, JitType, MlirBackend, MlirColumn, PipelineSpec,
+    RecordPipelineOutput,
 };
 
 thread_local! {
     static RECORD_PIPELINE_CACHE: RefCell<HashMap<String, CompiledRecordPipeline>> =
         RefCell::new(HashMap::new());
-    static F64_FILTER_SUM_CACHE: RefCell<HashMap<String, CompiledF64FilterSum>> =
-        RefCell::new(HashMap::new());
-    static DECIMAL_FILTER_SUM_CACHE: RefCell<HashMap<String, CompiledDecimalFilterSum>> =
+    static PLAIN_SUM_CACHE: RefCell<HashMap<String, CompiledPlainSum>> =
         RefCell::new(HashMap::new());
 }
 
@@ -85,31 +83,7 @@ pub fn execute_filter_sum(
     }
 
     match &kernel.spec {
-        PipelineSpec::F64FilterSum {
-            predicate_column,
-            measure_left_column,
-            measure_right_column,
-            ..
-        } => execute_f64_filter_sum(
-            runtime,
-            batch,
-            *predicate_column,
-            *measure_left_column,
-            *measure_right_column,
-        ),
-        PipelineSpec::DecimalFilterSum {
-            predicates,
-            measure_left_column,
-            measure_right_column,
-            output_scale,
-        } => execute_decimal_filter_sum(
-            runtime,
-            batch,
-            predicates,
-            *measure_left_column,
-            *measure_right_column,
-            *output_scale,
-        ),
+        PipelineSpec::PlainSum { columns, .. } => execute_plain_sum(runtime, batch, columns),
         _ => Ok(None),
     }
 }
@@ -118,46 +92,21 @@ fn filter_project_cache_key(runtime: &FilterProjectKernel) -> String {
     format!("{:?}|{:?}", runtime.predicate(), runtime.projections())
 }
 
-fn execute_f64_filter_sum(
+fn execute_plain_sum(
     runtime: &FilterSumKernel,
     batch: &RecordBatch,
-    predicate_col: usize,
-    left_col: usize,
-    right_col: usize,
+    columns: &[MlirColumn],
 ) -> Result<Option<FilterSumValue>> {
-    let predicate = int64_column(batch, predicate_col)?;
-    let left = float64_column(batch, left_col)?;
-    let right = float64_column(batch, right_col)?;
-    let Some(predicate_values) = int64_values(predicate) else {
+    let Some(inputs) = fixed_inputs(batch, columns)? else {
         return Ok(None);
     };
-    let Some(left_values) = float64_values(left) else {
-        return Ok(None);
-    };
-    let Some(right_values) = float64_values(right) else {
-        return Ok(None);
-    };
-    let inputs = [
-        FixedColumnInput::Int64 {
-            index: predicate_col,
-            values: predicate_values,
-        },
-        FixedColumnInput::Float64 {
-            index: left_col,
-            values: left_values,
-        },
-        FixedColumnInput::Float64 {
-            index: right_col,
-            values: right_values,
-        },
-    ];
 
     let cache_key = filter_sum_cache_key(runtime);
-    let output = F64_FILTER_SUM_CACHE.with(|cache| {
+    let output = PLAIN_SUM_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&cache_key) {
-            let compiled = MlirBackend::new()
-                .compile_f64_filter_sum(runtime.predicate(), runtime.measure())?;
+            let compiled =
+                MlirBackend::new().compile_plain_sum(runtime.predicate(), runtime.measure())?;
             cache.insert(cache_key.clone(), compiled);
         }
         cache
@@ -165,42 +114,7 @@ fn execute_f64_filter_sum(
             .expect("compiled kernel was inserted")
             .invoke(&inputs)
     })?;
-
-    Ok(Some(FilterSumValue::Float64(
-        (output.count > 0).then_some(output.sum),
-    )))
-}
-
-fn execute_decimal_filter_sum(
-    runtime: &FilterSumKernel,
-    batch: &RecordBatch,
-    predicates: &[PredicateSpec],
-    left_col: usize,
-    right_col: usize,
-    scale: i8,
-) -> Result<Option<FilterSumValue>> {
-    let Some(inputs) = decimal_filter_sum_inputs(batch, predicates, left_col, right_col, scale)?
-    else {
-        return Ok(None);
-    };
-
-    let cache_key = filter_sum_cache_key(runtime);
-    let output = DECIMAL_FILTER_SUM_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if !cache.contains_key(&cache_key) {
-            let compiled = MlirBackend::new()
-                .compile_decimal_filter_sum(runtime.predicate(), runtime.measure())?;
-            cache.insert(cache_key.clone(), compiled);
-        }
-        cache
-            .get(&cache_key)
-            .expect("compiled kernel was inserted")
-            .invoke(&inputs)
-    })?;
-    Ok(Some(FilterSumValue::Decimal128 {
-        value: (output.count > 0).then_some(output.sum),
-        scale,
-    }))
+    Ok(Some(output))
 }
 
 fn filter_sum_cache_key(runtime: &FilterSumKernel) -> String {
@@ -325,127 +239,6 @@ impl OutputBuffer {
         };
         Ok(array)
     }
-}
-
-fn decimal_filter_sum_inputs<'a>(
-    batch: &'a RecordBatch,
-    predicates: &[PredicateSpec],
-    left_col: usize,
-    right_col: usize,
-    scale: i8,
-) -> Result<Option<Vec<FixedColumnInput<'a>>>> {
-    let mut inputs = Vec::new();
-    for predicate in predicates {
-        if push_predicate_input(&mut inputs, batch, predicate)?.is_none() {
-            return Ok(None);
-        }
-    }
-    if push_decimal_input(&mut inputs, batch, left_col, None)?.is_none()
-        || push_decimal_input(&mut inputs, batch, right_col, None)?.is_none()
-    {
-        return Ok(None);
-    }
-
-    let left = decimal128_column(batch, left_col)?;
-    let right = decimal128_column(batch, right_col)?;
-    if left.scale().saturating_add(right.scale()) != scale {
-        return Err(JitError::Backend(format!(
-            "decimal multiply scale {} + {} does not match output scale {}",
-            left.scale(),
-            right.scale(),
-            scale
-        )));
-    }
-    Ok(Some(inputs))
-}
-
-fn push_predicate_input<'a>(
-    inputs: &mut Vec<FixedColumnInput<'a>>,
-    batch: &'a RecordBatch,
-    predicate: &PredicateSpec,
-) -> Result<Option<()>> {
-    match *predicate {
-        PredicateSpec::Date32 { column, .. } => push_date32_input(inputs, batch, column),
-        PredicateSpec::Decimal128 { column, scale, .. } => {
-            push_decimal_input(inputs, batch, column, Some(scale))
-        }
-        PredicateSpec::Int64 { column, .. } => push_int64_input(inputs, batch, column),
-    }
-}
-
-fn push_date32_input<'a>(
-    inputs: &mut Vec<FixedColumnInput<'a>>,
-    batch: &'a RecordBatch,
-    index: usize,
-) -> Result<Option<()>> {
-    if has_input(inputs, index) {
-        return Ok(Some(()));
-    }
-    let array = date32_column(batch, index)?;
-    let Some(values) = date32_values(array) else {
-        return Ok(None);
-    };
-    inputs.push(FixedColumnInput::Date32 { index, values });
-    Ok(Some(()))
-}
-
-fn push_int64_input<'a>(
-    inputs: &mut Vec<FixedColumnInput<'a>>,
-    batch: &'a RecordBatch,
-    index: usize,
-) -> Result<Option<()>> {
-    if has_input(inputs, index) {
-        return Ok(Some(()));
-    }
-    let array = int64_column(batch, index)?;
-    let Some(values) = int64_values(array) else {
-        return Ok(None);
-    };
-    inputs.push(FixedColumnInput::Int64 { index, values });
-    Ok(Some(()))
-}
-
-fn push_decimal_input<'a>(
-    inputs: &mut Vec<FixedColumnInput<'a>>,
-    batch: &'a RecordBatch,
-    index: usize,
-    expected_scale: Option<i8>,
-) -> Result<Option<()>> {
-    if has_input(inputs, index) {
-        return Ok(Some(()));
-    }
-    let array = decimal128_column(batch, index)?;
-    if let Some(expected_scale) = expected_scale {
-        if array.scale() != expected_scale {
-            return Err(JitError::Backend(format!(
-                "decimal predicate scale {} does not match column scale {}",
-                expected_scale,
-                array.scale()
-            )));
-        }
-    }
-    let Some(values) = decimal128_values(array) else {
-        return Ok(None);
-    };
-    inputs.push(FixedColumnInput::Decimal128 { index, values });
-    Ok(Some(()))
-}
-
-fn has_input(inputs: &[FixedColumnInput<'_>], index: usize) -> bool {
-    inputs.iter().any(|input| match input {
-        FixedColumnInput::Date32 {
-            index: input_index, ..
-        }
-        | FixedColumnInput::Int64 {
-            index: input_index, ..
-        }
-        | FixedColumnInput::Float64 {
-            index: input_index, ..
-        }
-        | FixedColumnInput::Decimal128 {
-            index: input_index, ..
-        } => *input_index == index,
-    })
 }
 
 fn date32_values(array: &Date32Array) -> Option<&[i32]> {

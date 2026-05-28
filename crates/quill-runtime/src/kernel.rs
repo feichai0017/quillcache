@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use std::collections::BTreeMap;
 
-use quill_plan::{JitBinaryOp, JitExpr, JitProjection, JitResult, JitScalar, JitType};
+use quill_plan::{JitExpr, JitProjection, JitResult, JitType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedColumn {
@@ -28,38 +28,9 @@ pub enum PipelineSpec {
         columns: Vec<FixedColumn>,
         output_types: Vec<JitType>,
     },
-    F64FilterSum {
-        predicate_column: usize,
-        predicate_op: JitBinaryOp,
-        predicate_value: i64,
-        measure_left_column: usize,
-        measure_right_column: usize,
-    },
-    DecimalFilterSum {
-        predicates: Vec<PredicateSpec>,
-        measure_left_column: usize,
-        measure_right_column: usize,
-        output_scale: i8,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PredicateSpec {
-    Date32 {
-        column: usize,
-        op: JitBinaryOp,
-        value: i32,
-    },
-    Decimal128 {
-        column: usize,
-        op: JitBinaryOp,
-        value: i128,
-        scale: i8,
-    },
-    Int64 {
-        column: usize,
-        op: JitBinaryOp,
-        value: i64,
+    PlainSum {
+        columns: Vec<FixedColumn>,
+        output_type: JitType,
     },
 }
 
@@ -94,25 +65,19 @@ impl PipelineSpec {
     }
 
     pub fn filter_sum(predicate: &JitExpr, measure: &JitExpr) -> Option<Self> {
-        if let (Some((predicate_column, predicate_op, predicate_value)), Some((left, right))) =
-            (parse_i64_compare(predicate), parse_f64_mul(measure))
-        {
-            return Some(Self::F64FilterSum {
-                predicate_column,
-                predicate_op,
-                predicate_value,
-                measure_left_column: left,
-                measure_right_column: right,
-            });
+        if predicate.ty() != JitType::Bool || !is_plain_sum_output(measure.ty()) {
+            return None;
         }
 
-        let predicates = parse_fixed_predicates(predicate)?;
-        let (left, right, scale) = parse_decimal_mul(measure)?;
-        Some(Self::DecimalFilterSum {
-            predicates,
-            measure_left_column: left,
-            measure_right_column: right,
-            output_scale: scale,
+        let mut columns = BTreeMap::new();
+        collect_fixed_width_columns(predicate, &mut columns)?;
+        collect_fixed_width_columns(measure, &mut columns)?;
+        Some(Self::PlainSum {
+            columns: columns
+                .into_iter()
+                .map(|(index, ty)| FixedColumn { index, ty })
+                .collect(),
+            output_type: measure.ty(),
         })
     }
 
@@ -120,7 +85,7 @@ impl PipelineSpec {
         match self {
             Self::Generic { kind } => *kind,
             Self::RecordProject { .. } => KernelKind::FilterProject,
-            Self::F64FilterSum { .. } | Self::DecimalFilterSum { .. } => KernelKind::FilterSum,
+            Self::PlainSum { .. } => KernelKind::FilterSum,
         }
     }
 
@@ -128,8 +93,7 @@ impl PipelineSpec {
         match self {
             Self::Generic { kind } => kind.name(),
             Self::RecordProject { .. } => "record_project",
-            Self::F64FilterSum { .. } => "f64_filter_sum",
-            Self::DecimalFilterSum { .. } => "decimal_filter_sum",
+            Self::PlainSum { .. } => "plain_sum",
         }
     }
 }
@@ -253,206 +217,6 @@ fn ensure_record_output_type(ty: JitType) -> Option<()> {
     }
 }
 
-fn parse_i64_compare(expr: &JitExpr) -> Option<(usize, JitBinaryOp, i64)> {
-    let JitExpr::Binary {
-        op, left, right, ..
-    } = expr
-    else {
-        return None;
-    };
-    if !is_compare_op(*op) {
-        return None;
-    }
-
-    if let Some((column, threshold)) = parse_i64_column_literal(left, right) {
-        return Some((column, *op, threshold));
-    }
-    if let Some((column, threshold)) = parse_i64_column_literal(right, left) {
-        return Some((column, reverse_compare_op(*op), threshold));
-    }
-    None
-}
-
-fn parse_i64_column_literal(column: &JitExpr, literal: &JitExpr) -> Option<(usize, i64)> {
-    let JitExpr::Column {
-        index,
-        ty: JitType::Int64,
-        ..
-    } = column
-    else {
-        return None;
-    };
-    let JitExpr::Literal(JitScalar::Int64(value)) = literal else {
-        return None;
-    };
-    Some((*index, *value))
-}
-
-fn parse_fixed_predicates(expr: &JitExpr) -> Option<Vec<PredicateSpec>> {
-    let mut predicates = Vec::new();
-    collect_fixed_predicates(expr, &mut predicates)?;
-    Some(predicates)
-}
-
-fn collect_fixed_predicates(expr: &JitExpr, predicates: &mut Vec<PredicateSpec>) -> Option<()> {
-    if let JitExpr::Binary {
-        op: JitBinaryOp::And,
-        left,
-        right,
-        ..
-    } = expr
-    {
-        collect_fixed_predicates(left, predicates)?;
-        collect_fixed_predicates(right, predicates)?;
-        return Some(());
-    }
-
-    predicates.push(parse_fixed_predicate(expr)?);
-    Some(())
-}
-
-fn parse_fixed_predicate(expr: &JitExpr) -> Option<PredicateSpec> {
-    let JitExpr::Binary {
-        op, left, right, ..
-    } = expr
-    else {
-        return None;
-    };
-    if !is_compare_op(*op) {
-        return None;
-    }
-
-    if let Some(predicate) = parse_fixed_column_literal(left, *op, right) {
-        return Some(predicate);
-    }
-    parse_fixed_column_literal(right, reverse_compare_op(*op), left)
-}
-
-fn parse_fixed_column_literal(
-    column: &JitExpr,
-    op: JitBinaryOp,
-    literal: &JitExpr,
-) -> Option<PredicateSpec> {
-    match (column, literal) {
-        (
-            JitExpr::Column {
-                index,
-                ty: JitType::Date32,
-                ..
-            },
-            JitExpr::Literal(JitScalar::Date32(value)),
-        ) => Some(PredicateSpec::Date32 {
-            column: *index,
-            op,
-            value: *value,
-        }),
-        (
-            JitExpr::Column {
-                index,
-                ty: JitType::Decimal128 { scale, .. },
-                ..
-            },
-            JitExpr::Literal(JitScalar::Decimal128 {
-                value,
-                scale: literal_scale,
-                ..
-            }),
-        ) if scale == literal_scale => Some(PredicateSpec::Decimal128 {
-            column: *index,
-            op,
-            value: *value,
-            scale: *scale,
-        }),
-        (
-            JitExpr::Column {
-                index,
-                ty: JitType::Int64,
-                ..
-            },
-            JitExpr::Literal(JitScalar::Int64(value)),
-        ) => Some(PredicateSpec::Int64 {
-            column: *index,
-            op,
-            value: *value,
-        }),
-        _ => None,
-    }
-}
-
-fn parse_f64_mul(expr: &JitExpr) -> Option<(usize, usize)> {
-    let JitExpr::Binary {
-        op: JitBinaryOp::Mul,
-        left,
-        right,
-        ..
-    } = expr
-    else {
-        return None;
-    };
-    Some((parse_f64_column(left)?, parse_f64_column(right)?))
-}
-
-fn parse_f64_column(expr: &JitExpr) -> Option<usize> {
-    let JitExpr::Column {
-        index,
-        ty: JitType::Float64,
-        ..
-    } = expr
-    else {
-        return None;
-    };
-    Some(*index)
-}
-
-fn parse_decimal_mul(expr: &JitExpr) -> Option<(usize, usize, i8)> {
-    let JitExpr::Binary {
-        op: JitBinaryOp::Mul,
-        left,
-        right,
-        ty: JitType::Decimal128 { scale, .. },
-        ..
-    } = expr
-    else {
-        return None;
-    };
-    Some((
-        parse_decimal_column(left)?,
-        parse_decimal_column(right)?,
-        *scale,
-    ))
-}
-
-fn parse_decimal_column(expr: &JitExpr) -> Option<usize> {
-    let JitExpr::Column {
-        index,
-        ty: JitType::Decimal128 { .. },
-        ..
-    } = expr
-    else {
-        return None;
-    };
-    Some(*index)
-}
-
-fn is_compare_op(op: JitBinaryOp) -> bool {
-    matches!(
-        op,
-        JitBinaryOp::Eq
-            | JitBinaryOp::NotEq
-            | JitBinaryOp::Lt
-            | JitBinaryOp::LtEq
-            | JitBinaryOp::Gt
-            | JitBinaryOp::GtEq
-    )
-}
-
-fn reverse_compare_op(op: JitBinaryOp) -> JitBinaryOp {
-    match op {
-        JitBinaryOp::Lt => JitBinaryOp::Gt,
-        JitBinaryOp::LtEq => JitBinaryOp::GtEq,
-        JitBinaryOp::Gt => JitBinaryOp::Lt,
-        JitBinaryOp::GtEq => JitBinaryOp::LtEq,
-        JitBinaryOp::Eq | JitBinaryOp::NotEq => op,
-        _ => unreachable!("non-comparison operator cannot be reversed"),
-    }
+fn is_plain_sum_output(ty: JitType) -> bool {
+    matches!(ty, JitType::Float64 | JitType::Decimal128 { .. })
 }

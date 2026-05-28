@@ -6,9 +6,7 @@ pub(super) fn lower_quill_dialect(module: &QuillDialectModule) -> JitResult<Mlir
     verify_formal_quill_module(module)?;
     match module.pipeline_spec() {
         Some(PipelineSpec::RecordProject { .. }) => lower_filter_project(module),
-        Some(PipelineSpec::F64FilterSum { .. } | PipelineSpec::DecimalFilterSum { .. }) => {
-            lower_with_quill_pass(module)
-        }
+        Some(PipelineSpec::PlainSum { .. }) => lower_with_quill_pass(module),
         Some(spec) => Err(JitError::UnsupportedExpr(format!(
             "quill dialect lowering does not yet support {}",
             spec.name()

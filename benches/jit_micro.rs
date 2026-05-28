@@ -255,25 +255,25 @@ fn bench_pipeline_graph_and_mlir(c: &mut Criterion) {
             )
         });
     });
-    c.bench_function("compile/mlir_f64_filter_sum", |b| {
+    c.bench_function("compile/mlir_f64_plain_sum", |b| {
         let measure = measure();
         let predicate = sum_predicate();
         b.iter(|| {
             black_box(
                 backend
-                    .compile_f64_filter_sum(black_box(&predicate), black_box(&measure))
-                    .expect("compile f64 filter-sum"),
+                    .compile_plain_sum(black_box(&predicate), black_box(&measure))
+                    .expect("compile f64 plain sum"),
             )
         });
     });
-    c.bench_function("compile/mlir_decimal_filter_sum", |b| {
+    c.bench_function("compile/mlir_decimal_plain_sum", |b| {
         let predicate = q6_decimal_predicate();
         let measure = q6_decimal_measure();
         b.iter(|| {
             black_box(
                 backend
-                    .compile_decimal_filter_sum(black_box(&predicate), black_box(&measure))
-                    .expect("compile decimal filter-sum"),
+                    .compile_plain_sum(black_box(&predicate), black_box(&measure))
+                    .expect("compile decimal plain sum"),
             )
         });
     });
@@ -479,7 +479,7 @@ fn bench_compiled_record_pipeline_kernel(c: &mut Criterion) {
     });
 }
 
-fn bench_compiled_f64_filter_sum_kernel(c: &mut Criterion) {
+fn bench_compiled_f64_plain_sum_kernel(c: &mut Criterion) {
     let row_count = 65_536_i64;
     let predicate_values = (0..row_count)
         .map(|value| value % 1_000)
@@ -491,10 +491,10 @@ fn bench_compiled_f64_filter_sum_kernel(c: &mut Criterion) {
         .map(|value| 0.01 * ((value % 7) as f64))
         .collect::<Vec<_>>();
     let kernel = MlirBackend::new()
-        .compile_f64_filter_sum(&sum_predicate(), &measure())
-        .expect("compiled f64 filter-sum");
+        .compile_plain_sum(&sum_predicate(), &measure())
+        .expect("compiled f64 plain sum");
 
-    c.bench_function("kernel/f64_filter_sum_64k", |b| {
+    c.bench_function("kernel/f64_plain_sum_64k", |b| {
         b.iter(|| {
             black_box(
                 kernel
@@ -512,13 +512,13 @@ fn bench_compiled_f64_filter_sum_kernel(c: &mut Criterion) {
                             values: discounts.as_slice(),
                         },
                     ]))
-                    .expect("execute compiled filter-sum"),
+                    .expect("execute compiled plain sum"),
             );
         });
     });
 }
 
-fn bench_compiled_decimal_filter_sum_kernel(c: &mut Criterion) {
+fn bench_compiled_decimal_plain_sum_kernel(c: &mut Criterion) {
     let row_count = 65_536_i32;
     let shipdates = (0..row_count)
         .map(|value| 10 + (value % 12))
@@ -533,10 +533,10 @@ fn bench_compiled_decimal_filter_sum_kernel(c: &mut Criterion) {
         .map(|value| 2_000_i128 + i128::from(value % 600))
         .collect::<Vec<_>>();
     let kernel = MlirBackend::new()
-        .compile_decimal_filter_sum(&q6_decimal_predicate(), &q6_decimal_measure())
-        .expect("compiled decimal filter-sum");
+        .compile_plain_sum(&q6_decimal_predicate(), &q6_decimal_measure())
+        .expect("compiled decimal plain sum");
 
-    c.bench_function("kernel/decimal_filter_sum_64k", |b| {
+    c.bench_function("kernel/decimal_plain_sum_64k", |b| {
         b.iter(|| {
             black_box(
                 kernel
@@ -558,8 +558,7 @@ fn bench_compiled_decimal_filter_sum_kernel(c: &mut Criterion) {
                             values: black_box(quantities.as_slice()),
                         },
                     ])
-                    .map(|output| (output.sum, output.count))
-                    .expect("execute compiled decimal filter-sum"),
+                    .expect("execute compiled decimal plain sum"),
             );
         });
     });
@@ -570,8 +569,8 @@ criterion_group!(
     bench_pipeline_graph_and_mlir,
     bench_compiled_i64_filter_kernel,
     bench_compiled_record_pipeline_kernel,
-    bench_compiled_f64_filter_sum_kernel,
-    bench_compiled_decimal_filter_sum_kernel,
+    bench_compiled_f64_plain_sum_kernel,
+    bench_compiled_decimal_plain_sum_kernel,
     bench_quill_filter_project_kernel,
     bench_quill_filter_sum_kernel,
     bench_datafusion_filter_project,

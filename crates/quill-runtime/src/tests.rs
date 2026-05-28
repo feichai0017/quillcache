@@ -6,9 +6,7 @@ use arrow::record_batch::RecordBatch;
 
 use quill_plan::{JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType};
 
-use super::{
-    FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn, PipelineSpec, PredicateSpec,
-};
+use super::{FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn, PipelineSpec};
 
 #[test]
 fn executes_filter_project_with_nulls() {
@@ -153,7 +151,7 @@ fn implements_sql_three_valued_boolean_logic() {
 }
 
 #[test]
-fn executes_filter_sum_fast_path_with_nulls() {
+fn executes_plain_sum_with_nulls() {
     let input_schema = Arc::new(Schema::new(vec![
         Field::new("v", DataType::Int64, true),
         Field::new("price", DataType::Float64, true),
@@ -213,12 +211,22 @@ fn executes_filter_sum_fast_path_with_nulls() {
 
     assert_eq!(
         kernel.spec(),
-        Some(&PipelineSpec::F64FilterSum {
-            predicate_column: 0,
-            predicate_op: JitBinaryOp::Gt,
-            predicate_value: 10,
-            measure_left_column: 1,
-            measure_right_column: 2
+        Some(&PipelineSpec::PlainSum {
+            columns: vec![
+                FixedColumn {
+                    index: 0,
+                    ty: JitType::Int64
+                },
+                FixedColumn {
+                    index: 1,
+                    ty: JitType::Float64
+                },
+                FixedColumn {
+                    index: 2,
+                    ty: JitType::Float64
+                }
+            ],
+            output_type: JitType::Float64
         })
     );
 
@@ -227,7 +235,7 @@ fn executes_filter_sum_fast_path_with_nulls() {
 }
 
 #[test]
-fn executes_decimal_filter_sum_with_date_predicate() {
+fn executes_decimal_plain_sum_with_date_predicate() {
     let input_schema = Arc::new(Schema::new(vec![
         Field::new("shipdate", DataType::Date32, true),
         Field::new("price", DataType::Decimal128(15, 2), true),
@@ -290,35 +298,38 @@ fn executes_decimal_filter_sum_with_date_predicate() {
 
     assert_eq!(
         kernel.spec(),
-        Some(&PipelineSpec::DecimalFilterSum {
-            predicates: vec![
-                PredicateSpec::Date32 {
-                    column: 0,
-                    op: JitBinaryOp::GtEq,
-                    value: 10
+        Some(&PipelineSpec::PlainSum {
+            columns: vec![
+                FixedColumn {
+                    index: 0,
+                    ty: JitType::Date32
                 },
-                PredicateSpec::Decimal128 {
-                    column: 2,
-                    op: JitBinaryOp::GtEq,
-                    value: 5,
-                    scale: 2
+                FixedColumn {
+                    index: 1,
+                    ty: JitType::Decimal128 {
+                        precision: 15,
+                        scale: 2
+                    }
                 },
-                PredicateSpec::Decimal128 {
-                    column: 2,
-                    op: JitBinaryOp::LtEq,
-                    value: 7,
-                    scale: 2
+                FixedColumn {
+                    index: 2,
+                    ty: JitType::Decimal128 {
+                        precision: 15,
+                        scale: 2
+                    }
                 },
-                PredicateSpec::Decimal128 {
-                    column: 3,
-                    op: JitBinaryOp::Lt,
-                    value: 2_400,
-                    scale: 2
+                FixedColumn {
+                    index: 3,
+                    ty: JitType::Decimal128 {
+                        precision: 15,
+                        scale: 2
+                    }
                 },
             ],
-            measure_left_column: 1,
-            measure_right_column: 2,
-            output_scale: 4
+            output_type: JitType::Decimal128 {
+                precision: 30,
+                scale: 4
+            }
         })
     );
 

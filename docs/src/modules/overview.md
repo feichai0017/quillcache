@@ -61,7 +61,7 @@ The JIT subdirectories have stricter internal boundaries:
 - `quill-jit/src/mlir/compiled.rs`: `ExecutionEngine` invocation artifacts.
 - `quill-df/src/exec.rs`: unified DataFusion physical execution node for compiled
   record and scalar aggregate pipelines.
-- `quill-runtime/src/kernel.rs`: `PipelineSpec`, `PredicateSpec`, and compiled pipeline
+- `quill-runtime/src/kernel.rs`: `PipelineSpec` and compiled pipeline
   metadata.
 - `quill-runtime/src/record.rs`: fixed-width filter/project record-batch runtime.
 - `quill-runtime/src/sum.rs`: fixed-width plain `SUM` runtime and Q6-shaped decimal

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{JitBinaryOp, JitError, JitExpr, JitProjection, JitResult, JitScalar, JitType};
 
-use super::{MlirColumn, MlirModule};
+use super::MlirModule;
 
 static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -123,22 +123,6 @@ pub(super) fn lower_i64_filter(predicate: &JitExpr) -> JitResult<MlirModule> {
     Ok(MlirModule { symbol, text })
 }
 
-pub(super) fn filter_sum_columns(
-    predicate: &JitExpr,
-    measure: &JitExpr,
-) -> JitResult<Vec<MlirColumn>> {
-    let mut columns = BTreeMap::new();
-    collect_columns(predicate, &mut columns);
-    collect_columns(measure, &mut columns);
-    columns
-        .into_iter()
-        .map(|(index, ty)| {
-            ensure_filter_sum_type(ty)?;
-            Ok(MlirColumn { index, ty })
-        })
-        .collect()
-}
-
 pub(super) fn next_symbol(prefix: &str) -> String {
     let id = NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{id}")
@@ -218,16 +202,6 @@ fn ensure_single_i64_predicate(predicate: &JitExpr, context: &str) -> JitResult<
 
     ensure_single_i64_input(predicate, context)?;
     Ok(())
-}
-
-fn ensure_filter_sum_type(ty: JitType) -> JitResult<()> {
-    match ty {
-        JitType::Date32 | JitType::Int64 | JitType::Float64 | JitType::Decimal128 { .. } => Ok(()),
-        other => Err(JitError::UnsupportedExpr(format!(
-            "compiled plain SUM does not support {} input columns",
-            mlir_type(other)
-        ))),
-    }
 }
 
 fn ensure_single_i64_input(expr: &JitExpr, context: &str) -> JitResult<()> {

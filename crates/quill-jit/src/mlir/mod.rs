@@ -25,8 +25,8 @@ pub type MlirColumn = quill_runtime::FixedColumn;
 pub struct MlirBackend;
 
 pub use compiled::{
-    CompiledDecimalFilterSum, CompiledF64FilterSum, CompiledI64Filter, CompiledRecordPipeline,
-    DecimalFilterSumOutput, F64FilterSumOutput, FixedColumnInput, RecordPipelineOutput,
+    CompiledI64Filter, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput,
+    RecordPipelineOutput,
 };
 pub use dispatch::{execute_filter_project, execute_filter_sum};
 
@@ -77,24 +77,9 @@ impl MlirBackend {
         lower::lower_quill_dialect(&dialect)
     }
 
-    pub fn lower_f64_filter_sum(
-        &self,
-        predicate: &JitExpr,
-        measure: &JitExpr,
-    ) -> JitResult<MlirModule> {
+    pub fn lower_plain_sum(&self, predicate: &JitExpr, measure: &JitExpr) -> JitResult<MlirModule> {
         let pipeline = PipelineGraph::filter_sum(predicate.clone(), measure.clone());
-        let dialect = self.emit_quill_dialect(emit::next_symbol("quill_f64_filter_sum"), &pipeline);
-        lower::lower_quill_dialect(&dialect)
-    }
-
-    pub fn lower_decimal_filter_sum(
-        &self,
-        predicate: &JitExpr,
-        measure: &JitExpr,
-    ) -> JitResult<MlirModule> {
-        let pipeline = PipelineGraph::filter_sum(predicate.clone(), measure.clone());
-        let dialect =
-            self.emit_quill_dialect(emit::next_symbol("quill_decimal_filter_sum"), &pipeline);
+        let dialect = self.emit_quill_dialect(emit::next_symbol("quill_plain_sum"), &pipeline);
         lower::lower_quill_dialect(&dialect)
     }
 
@@ -157,26 +142,26 @@ impl MlirBackend {
         compiled::compile_record_pipeline(&module, columns, output_types)
     }
 
-    pub fn compile_f64_filter_sum(
+    pub fn compile_plain_sum(
         &self,
         predicate: &JitExpr,
         measure: &JitExpr,
-    ) -> JitResult<CompiledF64FilterSum> {
-        let columns = emit::filter_sum_columns(predicate, measure)?;
-        let module = self.lower_f64_filter_sum(predicate, measure)?;
+    ) -> JitResult<CompiledPlainSum> {
+        let spec = crate::PipelineSpec::filter_sum(predicate, measure).ok_or_else(|| {
+            crate::JitError::UnsupportedExpr(
+                "plain SUM requires fixed-width filter and aggregate expressions".to_string(),
+            )
+        })?;
+        let crate::PipelineSpec::PlainSum {
+            columns,
+            output_type,
+        } = spec
+        else {
+            unreachable!("filter_sum returned another spec")
+        };
+        let module = self.lower_plain_sum(predicate, measure)?;
         self.verify_module(&module)?;
-        compiled::compile_f64_filter_sum(&module, columns)
-    }
-
-    pub fn compile_decimal_filter_sum(
-        &self,
-        predicate: &JitExpr,
-        measure: &JitExpr,
-    ) -> JitResult<CompiledDecimalFilterSum> {
-        let columns = emit::filter_sum_columns(predicate, measure)?;
-        let module = self.lower_decimal_filter_sum(predicate, measure)?;
-        self.verify_module(&module)?;
-        compiled::compile_decimal_filter_sum(&module, columns)
+        compiled::compile_plain_sum(&module, columns, output_type)
     }
 
     pub fn verify_module(&self, module: &MlirModule) -> JitResult<()> {
