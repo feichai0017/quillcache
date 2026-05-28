@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::common::Result;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::ExecutionPlan;
 
 use quill_jit::{JitOptions, MlirBackend, PipelineLowering};
-use quill_plan::{JitExpr, JitProjection};
 use quill_runtime::{
     CompiledKernel, FilterProjectKernel, FilterSumKernel, KernelBackend, KernelKind, PipelineSpec,
 };
@@ -46,7 +44,7 @@ impl<'a> PipelineCompiler<'a> {
                     Ok(runtime) => runtime,
                     Err(_) => return Ok(None),
                 };
-                let kernel = self.filter_project_kernel(&runtime, &predicate, &projections);
+                let kernel = self.filter_project_kernel(&runtime);
                 let exec = CompiledPipelineExec::try_new(
                     input,
                     PipelineRuntime::RecordBatch(runtime),
@@ -61,7 +59,7 @@ impl<'a> PipelineCompiler<'a> {
                     Ok(runtime) => runtime,
                     Err(_) => return Ok(None),
                 };
-                let kernel = self.filter_sum_kernel(&runtime, &predicate, &measure);
+                let kernel = self.filter_sum_kernel(&runtime);
                 let exec = CompiledPipelineExec::try_new(
                     input,
                     PipelineRuntime::ScalarSum(runtime),
@@ -89,63 +87,39 @@ impl<'a> PipelineCompiler<'a> {
         Ok(Arc::new(repartition) as Arc<dyn ExecutionPlan>)
     }
 
-    fn filter_project_kernel(
-        &self,
-        runtime: &FilterProjectKernel,
-        predicate: &JitExpr,
-        projections: &[JitProjection],
-    ) -> CompiledKernel {
-        if let Ok(module) = self.backend.lower_record_pipeline(predicate, projections) {
-            let executable = self.backend.verify_module(&module).is_ok()
-                && self.options.mlir_execution_enabled();
-            let spec = runtime
-                .spec()
-                .cloned()
-                .unwrap_or_else(|| PipelineSpec::generic(KernelKind::FilterProject));
-            return CompiledKernel::with_spec(module.symbol, spec, self.backend.name(), executable);
-        }
-
-        match self.backend.compile_filter_project(
-            Arc::new(ArrowSchema::empty()),
-            predicate,
-            projections,
-        ) {
-            Ok(kernel) => kernel,
-            Err(_) => CompiledKernel::new(
-                "filter_project_runtime",
-                KernelKind::FilterProject,
-                "fixed-width-runtime",
-                false,
-            ),
-        }
+    fn filter_project_kernel(&self, runtime: &FilterProjectKernel) -> CompiledKernel {
+        let spec = runtime
+            .spec()
+            .cloned()
+            .unwrap_or_else(|| PipelineSpec::generic(KernelKind::FilterProject));
+        let executable = self.options.mlir_execution_enabled() && runtime.spec().is_some();
+        CompiledKernel::with_spec(
+            "record_filter_project",
+            spec,
+            self.kernel_backend_name(executable),
+            executable,
+        )
     }
 
-    fn filter_sum_kernel(
-        &self,
-        runtime: &FilterSumKernel,
-        predicate: &JitExpr,
-        measure: &JitExpr,
-    ) -> CompiledKernel {
-        let spec = || {
-            runtime
-                .spec()
-                .cloned()
-                .unwrap_or_else(|| PipelineSpec::generic(KernelKind::FilterSum))
-        };
-        if let Ok(module) = self.backend.lower_plain_sum(predicate, measure) {
-            return CompiledKernel::with_spec(
-                module.symbol,
-                spec(),
-                self.backend.name(),
-                self.options.mlir_execution_enabled(),
-            );
-        }
-
-        CompiledKernel::new(
-            "fixed_width_filter_sum",
-            KernelKind::FilterSum,
-            "fixed-width-runtime",
-            false,
+    fn filter_sum_kernel(&self, runtime: &FilterSumKernel) -> CompiledKernel {
+        let spec = runtime
+            .spec()
+            .cloned()
+            .unwrap_or_else(|| PipelineSpec::generic(KernelKind::FilterSum));
+        let executable = self.options.mlir_execution_enabled() && runtime.spec().is_some();
+        CompiledKernel::with_spec(
+            "filter_plain_sum",
+            spec,
+            self.kernel_backend_name(executable),
+            executable,
         )
+    }
+
+    fn kernel_backend_name(&self, executable: bool) -> &str {
+        if executable {
+            self.backend.name()
+        } else {
+            "quill-runtime"
+        }
     }
 }

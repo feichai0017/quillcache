@@ -121,7 +121,8 @@ Useful knobs:
 - `QUILL_JIT=mlir`: executable MLIR kernels. This is the default mode.
 - `QUILL_JIT=runtime`: Quill Arrow runtime without executable MLIR, kept for
   benchmark comparison.
-- `QUILL_TPCH_SF=1`: generate SF1 TPC-H data.
+- `QUILL_TPCH_SF=<scale>`: choose generated TPC-H scale factor. The default is
+  SF1.
 - `QUILL_TPCH_DIR=/path/to/tpch-parquet`: use an existing Parquet dataset.
 
 ## Scope

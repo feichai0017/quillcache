@@ -58,13 +58,13 @@ cargo bench --bench jit_micro -- --sample-size 10
 ## TPC-H
 
 `benches/tpch.rs` is the analytical benchmark harness. It expects Parquet data.
-By default it uses the pure Rust `tpchgen-cli` generator to create SF0.01 data
-inside the repository under `benchdata/tpch-sf0.01`. Each query reports two
+By default it uses the pure Rust `tpchgen-cli` generator to create SF1 data
+inside the repository under `benchdata/tpch-sf1`. Each query reports two
 measurements:
 
-- `sql/df/<query>` runs through `Database::run`, including SQL parsing, logical
-  optimization, physical planning, and execution.
-- `prepared/df/<query>` runs a `PreparedQuery`, reusing the SQL/logical plan while
+- `sql/<mode>/<query>` runs through `Database::run`, including SQL parsing,
+  logical optimization, physical planning, and execution.
+- `prepared/<mode>/<query>` runs a `PreparedQuery`, reusing the SQL/logical plan while
   letting DataFusion create a fresh physical plan for each execution. DataFusion
   physical plans are not assumed to be reentrant.
 
@@ -78,13 +78,18 @@ Generated data is outside version control. Useful knobs:
 
 | Variable | Meaning |
 | -------- | ------- |
-| `QUILL_TPCH_SF` | Scale factor for generated data, default `0.01`. |
+| `QUILL_TPCH_SF` | Scale factor for generated data, default `1`. |
 | `QUILL_TPCH_GEN_THREADS` | Number of generator threads. |
 | `QUILL_TPCH_REGENERATE=1` | Delete and rebuild the generated data directory. |
 | `QUILL_TPCH_DIR` | Use an existing Parquet dataset instead of generating one. |
 | `QUILL_JIT=off` | Keep the pure DataFusion physical plan for baseline measurements. |
 | `QUILL_JIT=mlir` | Use executable MLIR dispatch. This is the default. |
 | `QUILL_JIT=runtime` | Use Quill's compiled pipeline runtime without executable MLIR for comparison. |
+
+TPC-H mode names are reported as `datafusion/native`, `quill/host-runtime`,
+and `quill/mlir-jit`. The primary comparison is `datafusion/native` versus
+`quill/mlir-jit`; `quill/host-runtime` is an ablation that measures replacement
+and Arrow host overhead without MLIR execution.
 
 When `QUILL_TPCH_DIR` is set, the directory can contain either
 `<table>.parquet` files or table directories:

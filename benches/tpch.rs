@@ -6,7 +6,7 @@ use quill_core::database::{Database, DatabaseOptions};
 use quill_jit::JitOptions;
 use tpchgen_cli::{Compression, OutputFormat, Table, TpchGenerator};
 
-const DEFAULT_SCALE_FACTOR: f64 = 0.01;
+const DEFAULT_SCALE_FACTOR: f64 = 1.0;
 
 const Q1: &str = r#"
 select
@@ -116,21 +116,21 @@ fn query_modes(query: &TpchQuery) -> Vec<TpchMode> {
     if query.compare_jit_modes {
         vec![
             TpchMode {
-                name: "datafusion",
+                name: "datafusion/native",
                 jit: JitOptions::disabled(),
             },
             TpchMode {
-                name: "runtime",
+                name: "quill/host-runtime",
                 jit: JitOptions::runtime(),
             },
             TpchMode {
-                name: "mlir",
+                name: "quill/mlir-jit",
                 jit: JitOptions::mlir_execution(),
             },
         ]
     } else {
         vec![TpchMode {
-            name: "datafusion",
+            name: "datafusion/native",
             jit: JitOptions::disabled(),
         }]
     }
@@ -153,22 +153,17 @@ fn warmup_and_bench(
         .block_on(prepared.run())
         .unwrap_or_else(|err| panic!("prepared warmup {}/{} failed: {}", mode, query.name, err));
 
+    group.bench_function(BenchmarkId::new(format!("sql/{mode}"), query.name), |b| {
+        b.iter(|| {
+            black_box(
+                runtime
+                    .block_on(db.run(black_box(query.sql)))
+                    .unwrap_or_else(|err| panic!("sql {}/{} failed: {}", mode, query.name, err)),
+            )
+        });
+    });
     group.bench_function(
-        BenchmarkId::new(format!("sql/df/{mode}"), query.name),
-        |b| {
-            b.iter(|| {
-                black_box(
-                    runtime
-                        .block_on(db.run(black_box(query.sql)))
-                        .unwrap_or_else(|err| {
-                            panic!("sql {}/{} failed: {}", mode, query.name, err)
-                        }),
-                )
-            });
-        },
-    );
-    group.bench_function(
-        BenchmarkId::new(format!("prepared/df/{mode}"), query.name),
+        BenchmarkId::new(format!("prepared/{mode}"), query.name),
         |b| {
             b.iter(|| {
                 black_box(runtime.block_on(prepared.run()).unwrap_or_else(|err| {

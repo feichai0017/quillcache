@@ -50,18 +50,26 @@ pub fn execute_filter_project(
         .map(OutputBuffer::as_output)
         .collect::<Vec<_>>();
     let cache_key = filter_project_cache_key(runtime);
-    let output_len = RECORD_PIPELINE_CACHE.with(|cache| {
+    let output_len = match RECORD_PIPELINE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&cache_key) {
-            let compiled = MlirBackend::new()
-                .compile_record_pipeline(runtime.predicate(), runtime.projections())?;
+            let compiled = match MlirBackend::new()
+                .compile_record_pipeline(runtime.predicate(), runtime.projections())
+            {
+                Ok(compiled) => compiled,
+                Err(_) => return Ok(None),
+            };
             cache.insert(cache_key.clone(), compiled);
         }
         cache
             .get(&cache_key)
             .expect("compiled kernel was inserted")
             .invoke(&inputs, &mut outputs)
-    })?;
+            .map(Some)
+    })? {
+        Some(output_len) => output_len,
+        None => return Ok(None),
+    };
 
     let arrays = buffers
         .into_iter()
@@ -102,18 +110,26 @@ fn execute_plain_sum(
     };
 
     let cache_key = filter_sum_cache_key(runtime);
-    let output = PLAIN_SUM_CACHE.with(|cache| {
+    let output = match PLAIN_SUM_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&cache_key) {
-            let compiled =
-                MlirBackend::new().compile_plain_sum(runtime.predicate(), runtime.measure())?;
+            let compiled = match MlirBackend::new()
+                .compile_plain_sum(runtime.predicate(), runtime.measure())
+            {
+                Ok(compiled) => compiled,
+                Err(_) => return Ok(None),
+            };
             cache.insert(cache_key.clone(), compiled);
         }
         cache
             .get(&cache_key)
             .expect("compiled kernel was inserted")
             .invoke(&inputs)
-    })?;
+            .map(Some)
+    })? {
+        Some(output) => output,
+        None => return Ok(None),
+    };
     Ok(Some(output))
 }
 
