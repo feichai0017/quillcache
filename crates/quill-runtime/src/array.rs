@@ -125,6 +125,21 @@ impl OutputBuilder {
         }
     }
 
+    pub(super) fn with_arrow_type(data_type: &ArrowDataType, capacity: usize) -> JitResult<Self> {
+        match data_type {
+            ArrowDataType::Boolean => Ok(Self::Bool(BooleanBuilder::with_capacity(capacity))),
+            ArrowDataType::Date32 => Ok(Self::Date32(Date32Builder::with_capacity(capacity))),
+            ArrowDataType::Int32 => Ok(Self::Int32(Int32Builder::with_capacity(capacity))),
+            ArrowDataType::Int64 => Ok(Self::Int64(Int64Builder::with_capacity(capacity))),
+            ArrowDataType::Float64 => Ok(Self::Float64(Float64Builder::with_capacity(capacity))),
+            ArrowDataType::Decimal128(precision, scale) => Ok(Self::Decimal128(
+                Decimal128Builder::with_capacity(capacity)
+                    .with_data_type(ArrowDataType::Decimal128(*precision, *scale)),
+            )),
+            other => Err(JitError::UnsupportedType(format!("{other:?}"))),
+        }
+    }
+
     pub(super) fn append(&mut self, value: Scalar) -> JitResult<()> {
         match (self, value) {
             (Self::Bool(builder), Scalar::Bool(value)) => builder.append_option(value),

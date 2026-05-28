@@ -51,7 +51,7 @@ pub(crate) fn from_physical(
     Err(JitError::UnsupportedExpr(expr.to_string()))
 }
 
-fn jit_type(data_type: &ArrowDataType) -> JitResult<JitType> {
+pub(crate) fn jit_type(data_type: &ArrowDataType) -> JitResult<JitType> {
     match data_type {
         ArrowDataType::Boolean => Ok(JitType::Bool),
         ArrowDataType::Date32 => Ok(JitType::Date32),

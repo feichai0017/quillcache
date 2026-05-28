@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::Date32Array;
-use datafusion::arrow::array::{Array, Decimal128Array, Float64Array, Int64Array};
+use datafusion::arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrameWriteOptions;
@@ -382,6 +382,182 @@ async fn debug_trace_reports_plain_sum_candidate() {
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates
+    );
+}
+
+#[tokio::test]
+async fn debug_trace_reports_group_aggregate_candidate() {
+    let db = Database::new(DatabaseOptions {
+        jit: JitOptions::disabled(),
+        ..Default::default()
+    })
+    .expect("database");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("shipdate", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            Arc::new(Date32Array::from(vec![19_724, 19_725, 19_724, 19_726])),
+        ],
+    )
+    .expect("batch");
+    db.register_batches("t", schema, vec![batch])
+        .expect("table");
+
+    assert_eq!(
+        rows(
+            db.run(
+                "select k, sum(v) as sum_v, count(*) as count_v \
+                 from t \
+                 where shipdate <= date '2024-01-04' \
+                 group by k \
+                 order by k",
+            )
+            .await
+            .expect("query")
+        ),
+        vec![
+            vec!["1".to_string(), "30".to_string(), "2".to_string()],
+            vec!["2".to_string(), "70".to_string(), "2".to_string()],
+        ]
+    );
+
+    let trace = db.debug_last_trace().expect("trace");
+    assert!(
+        !trace.physical_plan.contains("CompiledPipelineExec"),
+        "{}",
+        trace.physical_plan
+    );
+    assert!(
+        trace
+            .pipeline_candidates
+            .iter()
+            .any(|candidate| candidate.node == "AggregateExec"
+                && candidate.kind == PipelineKind::Aggregate
+                && !candidate.compiled
+                && candidate.source == "arrow_batch"
+                && candidate.stages == vec!["filter"]
+                && candidate.sink == "group_aggregate"
+                && candidate.backend.is_none()
+                && candidate.reason == "candidate"),
+        "{:?}",
+        trace.pipeline_candidates
+    );
+}
+
+#[tokio::test]
+async fn group_aggregate_runtime_executes_partial_pipeline() {
+    let db = Database::new_temp().expect("database");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("shipdate", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            Arc::new(Date32Array::from(vec![19_724, 19_725, 19_724, 19_726])),
+        ],
+    )
+    .expect("batch");
+    db.register_batches("t", schema, vec![batch])
+        .expect("table");
+
+    assert_eq!(
+        rows(
+            db.run(
+                "select k, sum(v) as sum_v, count(*) as count_v, min(v) as min_v, max(v) as max_v \
+                 from t \
+                 where shipdate <= date '2024-01-04' \
+                 group by k \
+                 order by k",
+            )
+            .await
+            .expect("query")
+        ),
+        vec![
+            vec![
+                "1".to_string(),
+                "30".to_string(),
+                "2".to_string(),
+                "10".to_string(),
+                "20".to_string()
+            ],
+            vec![
+                "2".to_string(),
+                "70".to_string(),
+                "2".to_string(),
+                "30".to_string(),
+                "40".to_string()
+            ],
+        ]
+    );
+
+    let trace = db.debug_last_trace().expect("trace");
+    assert!(
+        trace.physical_plan.contains("CompiledPipelineExec"),
+        "{}",
+        trace.physical_plan
+    );
+    assert!(
+        trace
+            .pipeline_candidates
+            .iter()
+            .any(|candidate| candidate.node == "CompiledPipelineExec"
+                && candidate.kind == PipelineKind::Aggregate
+                && candidate.compiled
+                && candidate.source == "arrow_batch"
+                && candidate.stages == vec!["filter"]
+                && candidate.sink == "group_aggregate"
+                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.reason == "compiled"),
+        "{:?}",
+        trace.pipeline_candidates
+    );
+}
+
+#[tokio::test]
+async fn string_group_keys_stay_on_datafusion_until_key_interning() {
+    let db = Database::new_temp().expect("database");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "B"])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .expect("batch");
+    db.register_batches("t", schema, vec![batch])
+        .expect("table");
+
+    assert_eq!(
+        rows(
+            db.run("select flag, sum(v) from t group by flag order by flag")
+                .await
+                .expect("query")
+        ),
+        vec![
+            vec!["A".to_string(), "30".to_string()],
+            vec!["B".to_string(), "30".to_string()],
+        ]
+    );
+
+    let trace = db.debug_last_trace().expect("trace");
+    assert!(
+        !trace.physical_plan.contains("CompiledPipelineExec"),
+        "{}",
+        trace.physical_plan
     );
 }
 

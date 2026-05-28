@@ -104,7 +104,7 @@ Filter -> SUM(fixed-width expression)
   => filter_plain_sum => CompiledPipelineExec(kind=aggregate, sink=scalar_sum)
 
 Group keys + SUM/COUNT/MIN/MAX aggregate inputs
-  => quill.sink.group_aggregate dialect skeleton
+  => filter_group_aggregate/group_aggregate => CompiledPipelineExec(kind=aggregate, sink=group_aggregate)
 ```
 
 `crates/quill-df/src/extract.rs` also recognizes the common DataFusion shape where a
@@ -116,14 +116,14 @@ it no longer constructs shape-specific execution nodes directly. The recognized
 physical-plan shapes are also exposed as `PipelineGraph` candidates in debug traces,
 so future
 whole-pipeline lowering does not rely on string plan inspection. This lets the
-project measure real operator boundaries before taking on executable grouped
-aggregates, joins, hash repartitioning, or whole-query pipeline lowering. The
-plain aggregate path now has both a DataFusion-safe fixed-width Arrow runtime
-and an executable MLIR dispatch path for the same fixed-width column layout,
-using the same `PlainSum` `PipelineSpec`. The grouped
-aggregate graph and dialect op are present as the Q1 extension point, but the
-optimizer rule still leaves Q1 on DataFusion until the hash aggregate lowering
-is implemented.
+project measure real operator boundaries before taking on joins, hash
+repartitioning, or whole-query pipeline lowering. The plain aggregate path now
+has both a DataFusion-safe fixed-width Arrow runtime and an executable MLIR
+dispatch path for the same fixed-width column layout, using the same `PlainSum`
+`PipelineSpec`. Fixed-width grouped aggregates can now replace DataFusion's
+partial aggregate with a `quill-runtime` grouped aggregate pipeline, while Q1's
+string group keys still require the planned dictionary/interned-key binding
+before the Q1 hot path can move into Quill.
 
 The intended compiler path is:
 

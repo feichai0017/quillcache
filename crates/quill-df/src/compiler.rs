@@ -6,7 +6,8 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use quill_jit::{JitOptions, MlirBackend, PipelineLowering};
 use quill_runtime::{
-    CompiledKernel, FilterProjectKernel, FilterSumKernel, KernelBackend, KernelKind, PipelineSpec,
+    CompiledKernel, FilterProjectKernel, FilterSumKernel, GroupAggregateKernel, KernelBackend,
+    KernelKind, PipelineSpec,
 };
 
 use crate::extract::{OutputAdapter, PhysicalPipeline};
@@ -68,6 +69,32 @@ impl<'a> PipelineCompiler<'a> {
                 )?;
                 Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>))
             }
+            Some(PipelineLowering::GroupAggregate {
+                predicate,
+                keys,
+                aggregates,
+            }) => {
+                let stages = predicate
+                    .map(quill_plan::PipelineStage::Filter)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let runtime = match GroupAggregateKernel::try_new(
+                    &stages,
+                    keys,
+                    aggregates,
+                    Arc::clone(&output_schema),
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(_) => return Ok(None),
+                };
+                let exec = CompiledPipelineExec::try_new(
+                    input,
+                    PipelineRuntime::GroupAggregate(runtime),
+                    output_schema,
+                    self.group_aggregate_kernel(),
+                )?;
+                Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>))
+            }
             _ => Ok(None),
         }
     }
@@ -112,6 +139,15 @@ impl<'a> PipelineCompiler<'a> {
             spec,
             self.kernel_backend_name(executable),
             executable,
+        )
+    }
+
+    fn group_aggregate_kernel(&self) -> CompiledKernel {
+        CompiledKernel::new(
+            "group_aggregate",
+            KernelKind::GroupAggregate,
+            "quill-runtime",
+            false,
         )
     }
 

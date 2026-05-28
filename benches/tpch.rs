@@ -120,10 +120,6 @@ fn query_modes(query: &TpchQuery) -> Vec<TpchMode> {
                 jit: JitOptions::disabled(),
             },
             TpchMode {
-                name: "quill/host-runtime",
-                jit: JitOptions::runtime(),
-            },
-            TpchMode {
                 name: "quill/mlir-jit",
                 jit: JitOptions::mlir_execution(),
             },

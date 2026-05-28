@@ -280,6 +280,15 @@ impl PipelineGraph {
             .collect()
     }
 
+    pub fn kind(&self) -> PipelineKind {
+        match self.sink {
+            PipelineSink::RecordBatch => PipelineKind::Record,
+            PipelineSink::Sum { .. } | PipelineSink::GroupAggregate { .. } => {
+                PipelineKind::Aggregate
+            }
+        }
+    }
+
     pub fn sink_name(&self) -> &'static str {
         match &self.sink {
             PipelineSink::RecordBatch => "record_batch",
@@ -343,6 +352,7 @@ mod tests {
 
         assert!(pipeline.stage_names().is_empty());
         assert_eq!(pipeline.sink_name(), "group_aggregate");
+        assert_eq!(pipeline.kind(), crate::PipelineKind::Aggregate);
     }
 
     #[test]

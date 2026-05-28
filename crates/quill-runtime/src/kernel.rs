@@ -17,6 +17,7 @@ pub enum KernelKind {
     Projection,
     FilterProject,
     FilterSum,
+    GroupAggregate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +106,7 @@ impl KernelKind {
             Self::Projection => "projection",
             Self::FilterProject => "filter_project",
             Self::FilterSum => "filter_sum",
+            Self::GroupAggregate => "group_aggregate",
         }
     }
 }

@@ -21,7 +21,15 @@ mod tests {
             .map(|pattern| pattern.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, vec!["filter_project_record", "filter_plain_sum"]);
+        assert_eq!(
+            ids,
+            vec![
+                "filter_project_record",
+                "filter_plain_sum",
+                "filter_group_aggregate",
+                "group_aggregate"
+            ]
+        );
     }
 
     #[test]
@@ -64,5 +72,33 @@ mod tests {
         assert!(FusionRegistry::builtin()
             .match_pipeline(&pipeline)
             .is_none());
+    }
+
+    #[test]
+    fn matches_filter_group_aggregate_pipeline() {
+        use quill_plan::{AggregateFunc, GroupAggregate, JitType};
+
+        let predicate = JitExpr::Literal(JitScalar::Bool(true));
+        let key = JitExpr::Literal(JitScalar::Int64(1));
+        let aggregate = GroupAggregate::new(
+            AggregateFunc::Count,
+            JitExpr::Literal(JitScalar::Int64(1)),
+            JitType::Int64,
+            "count",
+        );
+        let pipeline = PipelineGraph::group_aggregate(
+            vec![PipelineStage::Filter(predicate)],
+            vec![key],
+            vec![aggregate],
+        );
+
+        let matched = FusionRegistry::builtin()
+            .match_pipeline(&pipeline)
+            .expect("fusion match");
+        assert_eq!(matched.pattern.lowering, FusionLoweringKind::GroupAggregate);
+        assert!(matches!(
+            matched.lowering,
+            PipelineLowering::GroupAggregate { .. }
+        ));
     }
 }

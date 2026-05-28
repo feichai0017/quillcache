@@ -5,6 +5,7 @@ use super::{FusionConstraint, FusionLoweringKind, FusionPattern};
 
 const FILTER_PROJECT_STAGES: [OperatorKind; 2] = [OperatorKind::Filter, OperatorKind::Project];
 const FILTER_STAGES: [OperatorKind; 1] = [OperatorKind::Filter];
+const NO_STAGES: [OperatorKind; 0] = [];
 const RECORD_CONSTRAINTS: [FusionConstraint; 2] = [
     FusionConstraint::ArrowBatchSource,
     FusionConstraint::FixedWidthRecordBatch,
@@ -13,7 +14,11 @@ const PLAIN_SUM_CONSTRAINTS: [FusionConstraint; 2] = [
     FusionConstraint::ArrowBatchSource,
     FusionConstraint::FixedWidthPlainAggregate,
 ];
-const BUILTIN_PATTERNS: [FusionPattern; 2] = [
+const GROUP_AGGREGATE_CONSTRAINTS: [FusionConstraint; 2] = [
+    FusionConstraint::ArrowBatchSource,
+    FusionConstraint::FixedWidthGroupAggregate,
+];
+const BUILTIN_PATTERNS: [FusionPattern; 4] = [
     FusionPattern {
         id: "filter_project_record",
         source: PipelineSource::ArrowBatch,
@@ -29,6 +34,22 @@ const BUILTIN_PATTERNS: [FusionPattern; 2] = [
         sink: OperatorKind::PlainAggregate,
         constraints: &PLAIN_SUM_CONSTRAINTS,
         lowering: FusionLoweringKind::PlainSum,
+    },
+    FusionPattern {
+        id: "filter_group_aggregate",
+        source: PipelineSource::ArrowBatch,
+        stages: &FILTER_STAGES,
+        sink: OperatorKind::GroupAggregate,
+        constraints: &GROUP_AGGREGATE_CONSTRAINTS,
+        lowering: FusionLoweringKind::GroupAggregate,
+    },
+    FusionPattern {
+        id: "group_aggregate",
+        source: PipelineSource::ArrowBatch,
+        stages: &NO_STAGES,
+        sink: OperatorKind::GroupAggregate,
+        constraints: &GROUP_AGGREGATE_CONSTRAINTS,
+        lowering: FusionLoweringKind::GroupAggregate,
     },
 ];
 

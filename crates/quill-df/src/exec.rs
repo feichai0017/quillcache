@@ -17,13 +17,15 @@ use futures::{ready, Stream, StreamExt};
 
 use quill_plan::PipelineKind;
 use quill_runtime::{
-    CompiledKernel, FilterProjectKernel, FilterSumKernel, FilterSumValue, KernelKind,
+    CompiledKernel, FilterProjectKernel, FilterSumKernel, FilterSumValue, GroupAggregateKernel,
+    GroupAggregateState, KernelKind,
 };
 
 #[derive(Debug, Clone)]
 pub enum PipelineRuntime {
     RecordBatch(FilterProjectKernel),
     ScalarSum(FilterSumKernel),
+    GroupAggregate(GroupAggregateKernel),
 }
 
 #[derive(Debug, Clone)]
@@ -40,13 +42,14 @@ impl PipelineRuntime {
         match self {
             Self::RecordBatch(_) => KernelKind::FilterProject,
             Self::ScalarSum(_) => KernelKind::FilterSum,
+            Self::GroupAggregate(_) => KernelKind::GroupAggregate,
         }
     }
 
     fn kind(&self) -> PipelineKind {
         match self {
             Self::RecordBatch(_) => PipelineKind::Record,
-            Self::ScalarSum(_) => PipelineKind::Aggregate,
+            Self::ScalarSum(_) | Self::GroupAggregate(_) => PipelineKind::Aggregate,
         }
     }
 
@@ -54,6 +57,7 @@ impl PipelineRuntime {
         match self {
             Self::RecordBatch(_) => "filter -> project",
             Self::ScalarSum(_) => "filter",
+            Self::GroupAggregate(runtime) => runtime.stage_names(),
         }
     }
 
@@ -61,6 +65,7 @@ impl PipelineRuntime {
         match self {
             Self::RecordBatch(_) => "record_batch",
             Self::ScalarSum(_) => "scalar_sum",
+            Self::GroupAggregate(_) => "group_aggregate",
         }
     }
 }
@@ -155,6 +160,15 @@ impl CompiledPipelineExec {
 
         runtime.execute(batch).map_err(crate::map_jit_err)
     }
+
+    fn accumulate_group_aggregate_batch(
+        &self,
+        runtime: &GroupAggregateKernel,
+        state: &mut GroupAggregateState,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        runtime.accumulate(state, batch).map_err(crate::map_jit_err)
+    }
 }
 
 impl DisplayAs for CompiledPipelineExec {
@@ -192,6 +206,19 @@ impl DisplayAs for CompiledPipelineExec {
                     runtime.measure()
                 )
             }
+            (PipelineRuntime::GroupAggregate(runtime), DisplayFormatType::Default)
+            | (PipelineRuntime::GroupAggregate(runtime), DisplayFormatType::Verbose) => {
+                write!(
+                    f,
+                    "CompiledPipelineExec: kind=aggregate, stages={}, sink={}, backend={}, executable={}, keys={}, aggregates={}",
+                    self.stage_names(),
+                    self.sink_name(),
+                    self.kernel.backend,
+                    self.kernel.executable,
+                    runtime.keys().len(),
+                    runtime.aggregates().len()
+                )
+            }
             (PipelineRuntime::RecordBatch(runtime), DisplayFormatType::TreeRender) => {
                 writeln!(
                     f,
@@ -218,6 +245,18 @@ impl DisplayAs for CompiledPipelineExec {
                 )?;
                 writeln!(f, "predicate={:?}", runtime.predicate())?;
                 writeln!(f, "measure={:?}", runtime.measure())
+            }
+            (PipelineRuntime::GroupAggregate(runtime), DisplayFormatType::TreeRender) => {
+                writeln!(
+                    f,
+                    "kind=aggregate, stages={}, sink={}, backend={}, executable={}",
+                    self.stage_names(),
+                    self.sink_name(),
+                    self.kernel.backend,
+                    self.kernel.executable
+                )?;
+                writeln!(f, "keys={}", runtime.keys().len())?;
+                writeln!(f, "aggregates={}", runtime.aggregates().len())
             }
         }
     }
@@ -286,6 +325,15 @@ impl ExecutionPlan for CompiledPipelineExec {
                 sum: None,
                 emitted: false,
             })),
+            PipelineRuntime::GroupAggregate(runtime) => {
+                Ok(Box::pin(CompiledGroupAggregateStream {
+                    schema: Arc::clone(&self.schema),
+                    input: self.input.execute(partition, context)?,
+                    exec: self.clone(),
+                    state: runtime.new_state(),
+                    emitted: false,
+                }))
+            }
         }
     }
 }
@@ -304,15 +352,23 @@ struct CompiledScalarSumStream {
     emitted: bool,
 }
 
+struct CompiledGroupAggregateStream {
+    schema: ArrowSchemaRef,
+    input: SendableRecordBatchStream,
+    exec: CompiledPipelineExec,
+    state: GroupAggregateState,
+    emitted: bool,
+}
+
 impl Stream for CompiledRecordPipelineStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let runtime = match &self.exec.runtime {
             PipelineRuntime::RecordBatch(runtime) => runtime.clone(),
-            PipelineRuntime::ScalarSum(_) => {
+            PipelineRuntime::ScalarSum(_) | PipelineRuntime::GroupAggregate(_) => {
                 return Poll::Ready(Some(Err(DataFusionError::Internal(
-                    "record pipeline stream cannot execute scalar sum runtime".to_string(),
+                    "record pipeline stream cannot execute aggregate runtime".to_string(),
                 ))));
             }
         };
@@ -335,7 +391,7 @@ impl Stream for CompiledScalarSumStream {
 
         let runtime = match &self.exec.runtime {
             PipelineRuntime::ScalarSum(runtime) => runtime.clone(),
-            PipelineRuntime::RecordBatch(_) => {
+            PipelineRuntime::RecordBatch(_) | PipelineRuntime::GroupAggregate(_) => {
                 return Poll::Ready(Some(Err(DataFusionError::Internal(
                     "scalar sum stream cannot execute record runtime".to_string(),
                 ))));
@@ -369,6 +425,46 @@ impl Stream for CompiledScalarSumStream {
     }
 }
 
+impl Stream for CompiledGroupAggregateStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.emitted {
+            return Poll::Ready(None);
+        }
+
+        let runtime = match &self.exec.runtime {
+            PipelineRuntime::GroupAggregate(runtime) => runtime.clone(),
+            PipelineRuntime::RecordBatch(_) | PipelineRuntime::ScalarSum(_) => {
+                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                    "group aggregate stream cannot execute non-group runtime".to_string(),
+                ))));
+            }
+        };
+
+        loop {
+            match ready!(self.input.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let mut state = std::mem::replace(&mut self.state, runtime.new_state());
+                    let result = self
+                        .exec
+                        .accumulate_group_aggregate_batch(&runtime, &mut state, &batch);
+                    self.state = state;
+                    if let Err(err) = result {
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                }
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+                None => {
+                    self.emitted = true;
+                    let state = std::mem::replace(&mut self.state, runtime.new_state());
+                    return Poll::Ready(Some(runtime.finish(state).map_err(crate::map_jit_err)));
+                }
+            }
+        }
+    }
+}
+
 impl RecordBatchStream for CompiledRecordPipelineStream {
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.schema)
@@ -376,6 +472,12 @@ impl RecordBatchStream for CompiledRecordPipelineStream {
 }
 
 impl RecordBatchStream for CompiledScalarSumStream {
+    fn schema(&self) -> ArrowSchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl RecordBatchStream for CompiledGroupAggregateStream {
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.schema)
     }

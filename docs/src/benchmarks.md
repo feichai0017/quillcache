@@ -4,10 +4,10 @@ QuillSQL uses benchmarks to separate three different claims:
 
 - JIT lowering cost: how much time QuillSQL spends building the JIT expression
   graph and MLIR.
-- DataFusion execution cost: how the current DataFusion path behaves on Arrow
-  batches or Parquet datasets, separately from SQL parsing and planning.
-- Compiled pipeline cost: how rewritten record and aggregate pipelines behave
-  before and after compiled MLIR function pointers are enabled.
+- DataFusion baseline cost: how the pure DataFusion path behaves on Arrow
+  batches or Parquet datasets.
+- MLIR JIT cost: how rewritten record and aggregate pipelines behave when
+  executable MLIR function pointers are enabled.
 
 The current code has a real `CompiledPipelineExec` node in the DataFusion hot
 path for both record and scalar-sum pipelines, and its execution body uses
@@ -40,8 +40,6 @@ Benchmarks:
 | `kernel/record_pipeline_64k` | Compiled MLIR record pipeline execution over 64K rows, compacting projected fixed-width columns. |
 | `kernel/f64_plain_sum_64k` | Compiled MLIR f64 filter/plain-SUM execution over 64K rows. |
 | `kernel/decimal_plain_sum_64k` | Compiled MLIR decimal filter/plain-SUM execution over 64K fixed-width column slices. |
-| `pipeline/record_filter_project_64k` | Direct fixed-width Arrow record pipeline execution outside DataFusion planning. |
-| `pipeline/scalar_sum_64k` | Direct fixed-width Arrow scalar-sum pipeline execution outside DataFusion planning. |
 | `sql/df/filter_project_64k` | DataFusion SQL planning/execution over a 64K-row in-memory Arrow table, including `CompiledPipelineExec` when the pattern matches. |
 | `sql/df/filter_sum_64k` | DataFusion SQL planning/execution over a 64K-row in-memory Arrow table, including `CompiledPipelineExec` when the pattern matches. |
 | `sql/df/prepared_filter_sum_64k` | Prepared-plan filter/sum execution that removes SQL parsing and logical-plan construction from the timed loop while still using DataFusion physical planning and execution. |
@@ -84,12 +82,10 @@ Generated data is outside version control. Useful knobs:
 | `QUILL_TPCH_DIR` | Use an existing Parquet dataset instead of generating one. |
 | `QUILL_JIT=off` | Keep the pure DataFusion physical plan for baseline measurements. |
 | `QUILL_JIT=mlir` | Use executable MLIR dispatch. This is the default. |
-| `QUILL_JIT=runtime` | Use Quill's compiled pipeline runtime without executable MLIR for comparison. |
 
-TPC-H mode names are reported as `datafusion/native`, `quill/host-runtime`,
-and `quill/mlir-jit`. The primary comparison is `datafusion/native` versus
-`quill/mlir-jit`; `quill/host-runtime` is an ablation that measures replacement
-and Arrow host overhead without MLIR execution.
+TPC-H mode names are reported as `datafusion/native` and `quill/mlir-jit`.
+The primary comparison is the pure DataFusion baseline versus executable MLIR
+JIT. Host-runtime ablation is intentionally not part of the benchmark report.
 
 When `QUILL_TPCH_DIR` is set, the directory can contain either
 `<table>.parquet` files or table directories:

@@ -63,8 +63,10 @@ surfaces. Rust calls into that package through `melior`.
 
 Current compiled coverage is intentionally narrow: fixed-width
 `filter -> project -> record_batch` and fixed-width `filter -> SUM`, including
-the Q6-style `Date32`/`Decimal128` case. Unsupported expressions or unsafe
-Arrow layouts stay on the safe Rust runtime or DataFusion path.
+the Q6-style `Date32`/`Decimal128` case. Fixed-width `group_aggregate`
+pipelines can be replaced through the Arrow host runtime; MLIR hash aggregate
+lowering is still the next step. Unsupported expressions or unsafe Arrow layouts
+stay on the safe Rust runtime or DataFusion path.
 
 ## Quick Start
 
@@ -112,15 +114,13 @@ cargo bench --bench tpch -- q6_scan_filter_aggregate
 
 Benchmark harnesses:
 
-- `jit_micro`: lowering, compile, kernel, pipeline, and small SQL paths.
+- `jit_micro`: lowering, MLIR compile, MLIR kernel, and small SQL paths.
 - `tpch`: Q6/Q1/Q3 analytical ladder over generated or external Parquet data.
 
 Useful knobs:
 
 - `QUILL_JIT=off`: pure DataFusion baseline.
 - `QUILL_JIT=mlir`: executable MLIR kernels. This is the default mode.
-- `QUILL_JIT=runtime`: Quill Arrow runtime without executable MLIR, kept for
-  benchmark comparison.
 - `QUILL_TPCH_SF=<scale>`: choose generated TPC-H scale factor. The default is
   SF1.
 - `QUILL_TPCH_DIR=/path/to/tpch-parquet`: use an existing Parquet dataset.

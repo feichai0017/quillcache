@@ -5,6 +5,7 @@ pub enum FusionConstraint {
     ArrowBatchSource,
     FixedWidthRecordBatch,
     FixedWidthPlainAggregate,
+    FixedWidthGroupAggregate,
 }
 
 impl FusionConstraint {
@@ -13,6 +14,7 @@ impl FusionConstraint {
             Self::ArrowBatchSource => "arrow_batch_source",
             Self::FixedWidthRecordBatch => "fixed_width_record_batch",
             Self::FixedWidthPlainAggregate => "fixed_width_plain_aggregate",
+            Self::FixedWidthGroupAggregate => "fixed_width_group_aggregate",
         }
     }
 }
@@ -21,6 +23,7 @@ impl FusionConstraint {
 pub enum FusionLoweringKind {
     Record,
     PlainSum,
+    GroupAggregate,
 }
 
 impl FusionLoweringKind {
@@ -28,6 +31,7 @@ impl FusionLoweringKind {
         match self {
             Self::Record => "record_filter_project",
             Self::PlainSum => "plain_sum_loop",
+            Self::GroupAggregate => "group_aggregate_loop",
         }
     }
 }

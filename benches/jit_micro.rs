@@ -10,7 +10,7 @@ use quill_jit::{JitOptions, MlirBackend, PipelineLowering};
 use quill_plan::{
     JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType, PipelineGraph, PipelineStage,
 };
-use quill_runtime::{FilterProjectKernel, FilterSumKernel, KernelBackend};
+use quill_runtime::KernelBackend;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -364,62 +364,6 @@ fn bench_datafusion_filter_sum(c: &mut Criterion) {
     });
 }
 
-fn bench_quill_filter_project_kernel(c: &mut Criterion) {
-    let input_schema = schema();
-    let output_schema = Arc::new(Schema::new(vec![Field::new(
-        "next_id",
-        DataType::Int64,
-        false,
-    )]));
-    let row_count = 65_536_i64;
-    let ids = (0..row_count).collect::<Vec<_>>();
-    let values = (0..row_count)
-        .map(|value| value % 1_000)
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(
-        input_schema,
-        vec![
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(Int64Array::from(values)),
-        ],
-    )
-    .expect("record batch");
-    let kernel =
-        FilterProjectKernel::try_new(predicate(), projections(), output_schema).expect("kernel");
-
-    c.bench_function("pipeline/record_filter_project_64k", |b| {
-        b.iter(|| black_box(kernel.execute(black_box(&batch)).expect("execute kernel")));
-    });
-}
-
-fn bench_quill_filter_sum_kernel(c: &mut Criterion) {
-    let input_schema = sum_schema();
-    let row_count = 65_536_i64;
-    let values = (0..row_count)
-        .map(|value| value % 1_000)
-        .collect::<Vec<_>>();
-    let prices = (0..row_count)
-        .map(|value| 100.0 + (value % 10) as f64)
-        .collect::<Vec<_>>();
-    let discounts = (0..row_count)
-        .map(|value| 0.01 * ((value % 7) as f64))
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(
-        input_schema,
-        vec![
-            Arc::new(Int64Array::from(values)),
-            Arc::new(Float64Array::from(prices)),
-            Arc::new(Float64Array::from(discounts)),
-        ],
-    )
-    .expect("record batch");
-    let kernel = FilterSumKernel::try_new(sum_predicate(), measure()).expect("kernel");
-
-    c.bench_function("pipeline/scalar_sum_64k", |b| {
-        b.iter(|| black_box(kernel.execute(black_box(&batch)).expect("execute kernel")));
-    });
-}
-
 fn bench_compiled_i64_filter_kernel(c: &mut Criterion) {
     let row_count = 65_536_i64;
     let values = (0..row_count)
@@ -571,8 +515,6 @@ criterion_group!(
     bench_compiled_record_pipeline_kernel,
     bench_compiled_f64_plain_sum_kernel,
     bench_compiled_decimal_plain_sum_kernel,
-    bench_quill_filter_project_kernel,
-    bench_quill_filter_sum_kernel,
     bench_datafusion_filter_project,
     bench_datafusion_filter_sum
 );

@@ -1,5 +1,6 @@
 use quill_plan::{
-    JitExpr, JitProjection, PipelineGraph, PipelineKind, PipelineSink, PipelineStage,
+    GroupAggregate, JitExpr, JitProjection, PipelineGraph, PipelineKind, PipelineSink,
+    PipelineStage,
 };
 
 use super::registry::FusionRegistry;
@@ -15,6 +16,11 @@ pub enum PipelineLowering {
         predicate: JitExpr,
         measure: JitExpr,
     },
+    GroupAggregate {
+        predicate: Option<JitExpr>,
+        keys: Vec<JitExpr>,
+        aggregates: Vec<GroupAggregate>,
+    },
 }
 
 impl PipelineLowering {
@@ -27,7 +33,7 @@ impl PipelineLowering {
     pub fn kind(&self) -> PipelineKind {
         match self {
             Self::Record { .. } => PipelineKind::Record,
-            Self::PlainSum { .. } => PipelineKind::Aggregate,
+            Self::PlainSum { .. } | Self::GroupAggregate { .. } => PipelineKind::Aggregate,
         }
     }
 }
@@ -39,6 +45,7 @@ pub(crate) fn extract_lowering(
     match kind {
         FusionLoweringKind::Record => extract_record_lowering(graph),
         FusionLoweringKind::PlainSum => extract_plain_sum_lowering(graph),
+        FusionLoweringKind::GroupAggregate => extract_group_aggregate_lowering(graph),
     }
 }
 
@@ -64,5 +71,21 @@ fn extract_plain_sum_lowering(graph: &PipelineGraph) -> Option<PipelineLowering>
     Some(PipelineLowering::PlainSum {
         predicate: predicate.clone(),
         measure: measure.clone(),
+    })
+}
+
+fn extract_group_aggregate_lowering(graph: &PipelineGraph) -> Option<PipelineLowering> {
+    let predicate = match graph.stages.as_slice() {
+        [] => None,
+        [PipelineStage::Filter(predicate)] => Some(predicate.clone()),
+        _ => return None,
+    };
+    let PipelineSink::GroupAggregate { keys, aggregates } = &graph.sink else {
+        return None;
+    };
+    Some(PipelineLowering::GroupAggregate {
+        predicate,
+        keys: keys.clone(),
+        aggregates: aggregates.clone(),
     })
 }

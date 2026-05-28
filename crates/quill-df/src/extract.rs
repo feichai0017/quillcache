@@ -13,8 +13,10 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use serde::Serialize;
 
-use quill_jit::PipelineLowering;
-use quill_plan::{JitExpr, JitProjection, JitResult, PipelineGraph, PipelineKind, PipelineStage};
+use quill_plan::{
+    AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitResult, JitScalar, PipelineGraph,
+    PipelineKind, PipelineStage,
+};
 
 use crate::{CompiledPipelineExec, PipelineRuntime};
 
@@ -55,10 +57,9 @@ pub(crate) struct OutputAdapter {
 
 impl PipelineMatch {
     pub fn candidate(&self) -> Option<PipelineCandidate> {
-        let kind = PipelineLowering::from_graph(&self.graph)?.kind();
         Some(PipelineCandidate {
             node: self.node,
-            kind,
+            kind: self.graph.kind(),
             source: self.graph.source.name(),
             stages: self.graph.stage_names(),
             sink: self.graph.sink_name(),
@@ -101,13 +102,27 @@ impl PhysicalPipeline {
             output_adapter,
         }
     }
+
+    pub fn group_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        output_schema: ArrowSchemaRef,
+        graph: PipelineGraph,
+    ) -> Self {
+        Self {
+            input,
+            output_schema,
+            graph,
+            output_adapter: None,
+        }
+    }
 }
 
 pub(crate) fn extract_pipeline_from_node(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<PhysicalPipeline> {
     if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
-        return extract_filter_sum_pipeline(aggregate);
+        return extract_filter_sum_pipeline(aggregate)
+            .or_else(|| extract_group_aggregate_pipeline(aggregate));
     }
 
     let projection = plan.as_any().downcast_ref::<ProjectionExec>()?;
@@ -124,6 +139,16 @@ pub(crate) fn pipeline_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<Pipeli
             PipelineRuntime::ScalarSum(runtime) => {
                 PipelineGraph::filter_sum(runtime.predicate().clone(), runtime.measure().clone())
             }
+            PipelineRuntime::GroupAggregate(runtime) => PipelineGraph::group_aggregate(
+                runtime
+                    .predicate()
+                    .cloned()
+                    .map(PipelineStage::Filter)
+                    .into_iter()
+                    .collect(),
+                runtime.keys().to_vec(),
+                runtime.aggregates().to_vec(),
+            ),
         };
         return Some(PipelineMatch {
             node: "CompiledPipelineExec",
@@ -135,8 +160,17 @@ pub(crate) fn pipeline_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<Pipeli
     }
 
     let aggregate = plan.as_any().downcast_ref::<AggregateExec>()?;
-    let pipeline = extract_filter_sum_pipeline(aggregate)?;
-    Some(PipelineMatch {
+    if let Some(pipeline) = extract_filter_sum_pipeline(aggregate) {
+        return Some(PipelineMatch {
+            node: "AggregateExec",
+            graph: pipeline.graph,
+            compiled: false,
+            backend: None,
+            reason: "candidate",
+        });
+    }
+
+    extract_group_aggregate_pipeline(aggregate).map(|pipeline| PipelineMatch {
         node: "AggregateExec",
         graph: pipeline.graph,
         compiled: false,
@@ -198,7 +232,7 @@ pub(crate) fn extract_filter_sum_pipeline(aggregate: &AggregateExec) -> Option<P
         return None;
     }
 
-    let input = strip_filter_sum_adapters(aggregate.input());
+    let input = strip_pipeline_adapters(aggregate.input());
     let filter = input.as_any().downcast_ref::<FilterExec>()?;
     if filter.fetch().is_some() {
         return None;
@@ -218,6 +252,63 @@ pub(crate) fn extract_filter_sum_pipeline(aggregate: &AggregateExec) -> Option<P
         aggregate.schema(),
         predicate,
         measure,
+    ))
+}
+
+fn extract_group_aggregate_pipeline(aggregate: &AggregateExec) -> Option<PhysicalPipeline> {
+    if *aggregate.mode() != AggregateMode::Partial
+        || aggregate.group_expr().is_true_no_grouping()
+        || !aggregate.group_expr().is_single()
+        || aggregate.group_expr().groups().len() != 1
+        || aggregate
+            .group_expr()
+            .groups()
+            .first()
+            .is_some_and(|group| group.iter().any(|is_null| *is_null))
+        || aggregate.aggr_expr().is_empty()
+        || aggregate.filter_expr().iter().any(Option::is_some)
+    {
+        return None;
+    }
+
+    let input = strip_pipeline_adapters(aggregate.input());
+    let (input, stages, projection) =
+        if let Some(filter) = input.as_any().downcast_ref::<FilterExec>() {
+            if filter.fetch().is_some() {
+                return None;
+            }
+            let predicate =
+                crate::expr::from_physical(filter.predicate(), filter.input().schema().as_ref())
+                    .ok()?;
+            (
+                filter.input(),
+                vec![PipelineStage::Filter(predicate)],
+                filter.projection().as_ref().map(AsRef::as_ref),
+            )
+        } else {
+            (input, Vec::new(), None)
+        };
+
+    let aggregate_input_schema = aggregate.input().schema();
+    let input_schema = input.schema();
+    let keys = lower_group_keys(
+        aggregate,
+        aggregate_input_schema.as_ref(),
+        projection,
+        input_schema.as_ref(),
+    )?;
+    let aggregates = lower_group_aggregates(
+        aggregate,
+        aggregate_input_schema.as_ref(),
+        projection,
+        input_schema.as_ref(),
+    )?;
+
+    let graph = PipelineGraph::group_aggregate(stages, keys, aggregates);
+    Some(PhysicalPipeline::group_aggregate(
+        Arc::clone(input),
+        aggregate.schema(),
+        graph,
     ))
 }
 
@@ -244,16 +335,84 @@ fn is_supported_sum_output(data_type: &ArrowDataType) -> bool {
 }
 
 #[allow(deprecated)]
-fn strip_filter_sum_adapters(input: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
+fn strip_pipeline_adapters(input: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     if let Some(coalesce) = input.as_any().downcast_ref::<CoalesceBatchesExec>() {
-        return strip_filter_sum_adapters(coalesce.input());
+        return strip_pipeline_adapters(coalesce.input());
     }
     if let Some(repartition) = input.as_any().downcast_ref::<RepartitionExec>() {
         if matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_)) {
-            return strip_filter_sum_adapters(repartition.input());
+            return strip_pipeline_adapters(repartition.input());
         }
     }
     input
+}
+
+fn lower_group_keys(
+    aggregate: &AggregateExec,
+    aggregate_input_schema: &ArrowSchema,
+    projection: Option<&[usize]>,
+    input_schema: &ArrowSchema,
+) -> Option<Vec<JitExpr>> {
+    aggregate
+        .group_expr()
+        .expr()
+        .iter()
+        .map(|(expr, _alias)| {
+            let expr = crate::expr::from_physical(expr, aggregate_input_schema).ok()?;
+            remap_projection_columns(&expr, projection, input_schema)
+        })
+        .collect()
+}
+
+fn lower_group_aggregates(
+    aggregate: &AggregateExec,
+    aggregate_input_schema: &ArrowSchema,
+    projection: Option<&[usize]>,
+    input_schema: &ArrowSchema,
+) -> Option<Vec<GroupAggregate>> {
+    aggregate
+        .aggr_expr()
+        .iter()
+        .map(|expr| {
+            if expr.is_distinct() || !expr.order_bys().is_empty() {
+                return None;
+            }
+            let func = aggregate_func(expr.fun().name())?;
+            let arguments = expr.expressions();
+            let measure = match func {
+                AggregateFunc::Count if arguments.is_empty() => {
+                    JitExpr::Literal(JitScalar::Int64(1))
+                }
+                _ if arguments.len() == 1 => {
+                    let lowered =
+                        crate::expr::from_physical(&arguments[0], aggregate_input_schema).ok()?;
+                    remap_projection_columns(&lowered, projection, input_schema)?
+                }
+                _ => return None,
+            };
+            let output_type = crate::expr::jit_type(expr.field().data_type()).ok()?;
+            Some(GroupAggregate::new(
+                func,
+                measure,
+                output_type,
+                expr.name().to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn aggregate_func(name: &str) -> Option<AggregateFunc> {
+    if name.eq_ignore_ascii_case("sum") {
+        Some(AggregateFunc::Sum)
+    } else if name.eq_ignore_ascii_case("count") {
+        Some(AggregateFunc::Count)
+    } else if name.eq_ignore_ascii_case("min") {
+        Some(AggregateFunc::Min)
+    } else if name.eq_ignore_ascii_case("max") {
+        Some(AggregateFunc::Max)
+    } else {
+        None
+    }
 }
 
 fn lower_sum_measure(aggregate: &AggregateExec, input_schema: &ArrowSchema) -> Option<JitExpr> {

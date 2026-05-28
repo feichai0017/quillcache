@@ -4,9 +4,15 @@ use arrow::array::{Array, BooleanArray, Date32Array, Decimal128Array, Float64Arr
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use quill_plan::{JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType};
+use quill_plan::{
+    AggregateFunc, GroupAggregate, JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType,
+    PipelineStage,
+};
 
-use super::{FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn, PipelineSpec};
+use super::{
+    FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn, GroupAggregateKernel,
+    PipelineSpec,
+};
 
 #[test]
 fn executes_filter_project_with_nulls() {
@@ -341,6 +347,102 @@ fn executes_decimal_plain_sum_with_date_predicate() {
             scale: 4
         }
     );
+}
+
+#[test]
+fn executes_group_aggregate_with_filter() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+        Field::new("shipdate", DataType::Date32, true),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("sum_v", DataType::Int64, true),
+        Field::new("count_v", DataType::Int64, false),
+        Field::new("min_v", DataType::Int64, true),
+        Field::new("max_v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), Some(2)])),
+            Arc::new(Int64Array::from(vec![Some(10), Some(20), Some(30), None])),
+            Arc::new(Date32Array::from(vec![
+                Some(10),
+                Some(11),
+                Some(10),
+                Some(12),
+            ])),
+        ],
+    )
+    .unwrap();
+    let predicate = date_cmp(JitBinaryOp::LtEq, 2, 12);
+    let key = JitExpr::Column {
+        index: 0,
+        name: "k".to_string(),
+        ty: JitType::Int64,
+        nullable: true,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: true,
+    };
+    let aggregates = vec![
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            value.clone(),
+            JitType::Int64,
+            "count_v",
+        ),
+        GroupAggregate::new(AggregateFunc::Min, value.clone(), JitType::Int64, "min_v"),
+        GroupAggregate::new(AggregateFunc::Max, value, JitType::Int64, "max_v"),
+    ];
+    let kernel = GroupAggregateKernel::try_new(
+        &[PipelineStage::Filter(predicate)],
+        vec![key],
+        aggregates,
+        output_schema,
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    kernel.accumulate(&mut state, &batch).unwrap();
+    let output = kernel.finish(state).unwrap();
+
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mins = output
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let maxes = output
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(keys.values().as_ref(), &[1, 2]);
+    assert_eq!(sums.values().as_ref(), &[30, 30]);
+    assert_eq!(counts.values().as_ref(), &[2, 1]);
+    assert_eq!(mins.values().as_ref(), &[10, 30]);
+    assert_eq!(maxes.values().as_ref(), &[20, 30]);
 }
 
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {
