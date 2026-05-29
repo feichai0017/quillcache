@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use datafusion::arrow::array::{Float64Array, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -11,7 +11,7 @@ use quill_plan::{
     AggregateFunc, GroupAggregate, JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType,
     PipelineGraph, PipelineStage,
 };
-use quill_runtime::GroupAggregateStateField;
+use quill_runtime::{GroupAggregateKernel, GroupAggregateState, GroupAggregateStateField};
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -523,6 +523,117 @@ fn bench_compiled_group_aggregate_dense_update_kernel(c: &mut Criterion) {
     });
 }
 
+fn bench_group_aggregate_runtime_boundaries(c: &mut Criterion) {
+    let row_count = 65_536_i64;
+    let group_count = 1_024_usize;
+    let batch = group_batch(row_count, group_count);
+    let kernel = group_kernel();
+
+    c.bench_function("runtime/group_aggregate_bind_build_64k", |b| {
+        b.iter(|| {
+            let mut state = kernel.new_state();
+            black_box(
+                kernel
+                    .bind_batch(&mut state, black_box(&batch))
+                    .expect("bind group aggregate batch"),
+            );
+            black_box(state);
+        });
+    });
+
+    let mut probe_state = kernel.new_state();
+    kernel
+        .bind_batch(&mut probe_state, &batch)
+        .expect("seed group aggregate state");
+    c.bench_function("runtime/group_aggregate_bind_probe_64k", |b| {
+        b.iter(|| {
+            black_box(
+                kernel
+                    .bind_batch(black_box(&mut probe_state), black_box(&batch))
+                    .expect("probe group aggregate batch"),
+            );
+        });
+    });
+
+    c.bench_function("runtime/group_aggregate_finish_dense_1k_groups", |b| {
+        b.iter_batched(
+            || seeded_dense_group_state(&kernel, &batch),
+            |state| black_box(kernel.finish(state).expect("finish dense group aggregate")),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn group_batch(row_count: i64, group_count: usize) -> RecordBatch {
+    let keys = (0..row_count)
+        .map(|value| value % group_count as i64)
+        .collect::<Vec<_>>();
+    let values = (0..row_count)
+        .map(|value| value % 1_000)
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .expect("group aggregate batch")
+}
+
+fn group_kernel() -> GroupAggregateKernel {
+    GroupAggregateKernel::try_new(
+        &[],
+        vec![group_key()],
+        group_aggregates(),
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("sum_v", DataType::Int64, true),
+            Field::new("count_star", DataType::Int64, true),
+            Field::new("avg_count", DataType::UInt64, true),
+            Field::new("avg_v", DataType::Int64, true),
+        ])),
+    )
+    .expect("group aggregate kernel")
+}
+
+fn seeded_dense_group_state(
+    kernel: &GroupAggregateKernel,
+    batch: &RecordBatch,
+) -> GroupAggregateState {
+    let mut state = kernel.new_state();
+    kernel
+        .bind_batch(&mut state, batch)
+        .expect("bind group aggregate batch");
+    let dense = kernel
+        .dense_state_mut(&mut state)
+        .expect("dense group aggregate state");
+    for field in dense.fields_mut() {
+        match field {
+            GroupAggregateStateField::Int64 { values, valid } => {
+                values.fill(1);
+                valid.fill(1);
+            }
+            GroupAggregateStateField::UInt64 { values, valid } => {
+                values.fill(1);
+                valid.fill(1);
+            }
+            GroupAggregateStateField::Float64 { values, valid } => {
+                values.fill(1.0);
+                valid.fill(1);
+            }
+            GroupAggregateStateField::Decimal128 { values, valid, .. } => {
+                values.fill(1);
+                valid.fill(1);
+            }
+        }
+    }
+    state
+}
+
 fn group_key() -> JitExpr {
     JitExpr::Column {
         index: 0,
@@ -600,6 +711,7 @@ criterion_group!(
     bench_compiled_f64_plain_sum_kernel,
     bench_compiled_decimal_plain_sum_kernel,
     bench_compiled_group_aggregate_dense_update_kernel,
+    bench_group_aggregate_runtime_boundaries,
     bench_datafusion_filter_project,
     bench_datafusion_filter_sum
 );

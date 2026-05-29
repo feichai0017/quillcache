@@ -24,7 +24,7 @@ pub struct GroupAggregateKernel {
 #[derive(Debug, Clone)]
 pub struct GroupAggregateState {
     group_ids: BTreeMap<GroupKey, usize>,
-    fast_group_ids: BTreeMap<Vec<FastKeyValue>, usize>,
+    fast_group_ids: HashMap<Vec<FastKeyValue>, usize>,
     string_key_ids: Vec<HashMap<Arc<str>, u32>>,
     groups: Vec<GroupState>,
     dense: Option<GroupAggregateDenseState>,
@@ -88,7 +88,7 @@ enum KeyValue {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FastKeyValue {
     Bool(Option<bool>),
     Date32(Option<i32>),
@@ -192,7 +192,7 @@ impl GroupAggregateKernel {
     pub fn new_state(&self) -> GroupAggregateState {
         GroupAggregateState {
             group_ids: BTreeMap::new(),
-            fast_group_ids: BTreeMap::new(),
+            fast_group_ids: HashMap::new(),
             string_key_ids: vec![HashMap::new(); self.keys.len()],
             groups: Vec::new(),
             dense: None,
