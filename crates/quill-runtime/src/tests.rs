@@ -641,6 +641,90 @@ fn flushes_dense_group_state_before_runtime_fallback() {
     assert_eq!(sums.values().as_ref(), &[15, 7]);
 }
 
+#[test]
+fn finishes_group_aggregate_directly_from_dense_state() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("sum_v", DataType::Int64, true),
+        Field::new("count_v", DataType::Int64, true),
+    ]));
+    let key = JitExpr::Column {
+        index: 0,
+        name: "k".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let aggregates = vec![
+        GroupAggregate::new(AggregateFunc::Sum, value, JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            JitExpr::Literal(JitScalar::Int64(1)),
+            JitType::Int64,
+            "count_v",
+        ),
+    ];
+    let kernel = GroupAggregateKernel::try_new(&[], vec![key], aggregates, output_schema).unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    let binding = kernel.bind_batch(&mut state, &batch).unwrap();
+    assert_eq!(binding.group_ids(), &[0, 1]);
+
+    {
+        let dense = kernel.dense_state_mut(&mut state).unwrap();
+        let [GroupAggregateStateField::Int64 {
+            values: sums,
+            valid: sum_valid,
+        }, GroupAggregateStateField::Int64 {
+            values: counts,
+            valid: count_valid,
+        }] = dense.fields_mut()
+        else {
+            panic!("expected sum and count dense state fields");
+        };
+        sums.copy_from_slice(&[30, 20]);
+        sum_valid.copy_from_slice(&[1, 1]);
+        counts.copy_from_slice(&[2, 1]);
+        count_valid.copy_from_slice(&[1, 1]);
+    }
+
+    let output = kernel.finish(state).unwrap();
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(keys.values().as_ref(), &[1, 2]);
+    assert_eq!(sums.values().as_ref(), &[30, 20]);
+    assert_eq!(counts.values().as_ref(), &[2, 1]);
+}
+
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {
     JitExpr::Binary {
         op: JitBinaryOp::And,

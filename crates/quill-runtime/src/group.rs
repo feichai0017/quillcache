@@ -272,13 +272,14 @@ impl GroupAggregateKernel {
     }
 
     pub fn finish(&self, mut state: GroupAggregateState) -> JitResult<RecordBatch> {
-        state.flush_dense_state(&self.aggregates)?;
-        let mut builders = self
-            .schema
-            .fields()
-            .iter()
-            .map(|field| OutputBuilder::with_arrow_type(field.data_type(), state.groups.len()))
-            .collect::<JitResult<Vec<_>>>()?;
+        if let Some(dense) = state.dense.take() {
+            return self.finish_dense_state(state, dense);
+        }
+        self.finish_sparse_state(state)
+    }
+
+    fn finish_sparse_state(&self, state: GroupAggregateState) -> JitResult<RecordBatch> {
+        let mut builders = self.output_builders(state.groups.len())?;
 
         for group in state.sorted_groups() {
             for (value, builder) in group.key.0.into_iter().zip(&mut builders) {
@@ -306,6 +307,74 @@ impl GroupAggregateKernel {
             .collect::<JitResult<Vec<_>>>()?;
         RecordBatch::try_new(Arc::clone(&self.schema), arrays)
             .map_err(|err| JitError::Backend(err.to_string()))
+    }
+
+    fn finish_dense_state(
+        &self,
+        state: GroupAggregateState,
+        dense: GroupAggregateDenseState,
+    ) -> JitResult<RecordBatch> {
+        if dense.group_count != state.groups.len() {
+            return Err(JitError::Backend(format!(
+                "dense state has {} groups, runtime state has {}",
+                dense.group_count,
+                state.groups.len()
+            )));
+        }
+
+        let mut builders = self.output_builders(state.groups.len())?;
+        let mut sorted = state.group_ids.into_iter().collect::<Vec<_>>();
+        sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (key, group_id) in sorted {
+            if group_id >= state.groups.len() {
+                return Err(JitError::Backend(format!(
+                    "dense group id {group_id} out of bounds"
+                )));
+            }
+            for (value, builder) in key.0.into_iter().zip(&mut builders) {
+                builder.append(value.into_scalar())?;
+            }
+            let mut field_index = 0_usize;
+            let mut builder_index = self.keys.len();
+            for aggregate in &self.aggregates {
+                for _ in &aggregate.state_types {
+                    let field = dense.fields.get(field_index).ok_or_else(|| {
+                        JitError::Backend("missing dense aggregate state field".to_string())
+                    })?;
+                    let builder = builders.get_mut(builder_index).ok_or_else(|| {
+                        JitError::Backend(format!(
+                            "missing output builder for aggregate {}",
+                            aggregate.alias
+                        ))
+                    })?;
+                    builder.append(field.scalar(group_id)?)?;
+                    field_index += 1;
+                    builder_index += 1;
+                }
+            }
+            if field_index != dense.fields.len() {
+                return Err(JitError::Backend(format!(
+                    "dense state has {} fields, consumed {field_index}",
+                    dense.fields.len()
+                )));
+            }
+        }
+
+        let arrays = builders
+            .into_iter()
+            .map(OutputBuilder::finish)
+            .collect::<JitResult<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|err| JitError::Backend(err.to_string()))
+    }
+
+    fn output_builders(&self, capacity: usize) -> JitResult<Vec<OutputBuilder>> {
+        self.schema
+            .fields()
+            .iter()
+            .map(|field| OutputBuilder::with_arrow_type(field.data_type(), capacity))
+            .collect()
     }
 
     fn eval_key(&self, view: &BatchView<'_>, row: usize) -> JitResult<GroupKey> {
