@@ -207,6 +207,7 @@ impl GroupAggregateKernel {
         let view = BatchView::try_new(batch)?;
         let mut group_ids = Vec::with_capacity(batch.num_rows());
         let mut selected_rows = 0_usize;
+        let mut fast_key = Vec::with_capacity(self.keys.len());
 
         for row in 0..batch.num_rows() {
             if let Some(predicate) = &self.predicate {
@@ -216,7 +217,7 @@ impl GroupAggregateKernel {
                 }
             }
 
-            let group_id = self.group_id_for_row(state, &view, row)?;
+            let group_id = self.group_id_for_row(state, &view, row, &mut fast_key)?;
             let group_id = i64::try_from(group_id)
                 .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
             group_ids.push(group_id);
@@ -390,14 +391,15 @@ impl GroupAggregateKernel {
         state: &mut GroupAggregateState,
         view: &BatchView<'_>,
         row: usize,
+        fast_key: &mut Vec<FastKeyValue>,
     ) -> JitResult<usize> {
-        if let Some(fast_key) = self.fast_key_for_row(state, view, row)? {
+        if self.fast_key_for_row(state, view, row, fast_key)? {
             if let Some(group_id) = state.fast_group_ids.get(fast_key.as_slice()) {
                 return Ok(*group_id);
             }
 
             let key = self.eval_key(view, row)?;
-            return Ok(state.group_id_with_fast_key(key, fast_key, &self.aggregates));
+            return Ok(state.group_id_with_fast_key(key, fast_key.clone(), &self.aggregates));
         }
 
         let key = self.eval_key(view, row)?;
@@ -409,8 +411,9 @@ impl GroupAggregateKernel {
         state: &mut GroupAggregateState,
         view: &BatchView<'_>,
         row: usize,
-    ) -> JitResult<Option<Vec<FastKeyValue>>> {
-        let mut key = Vec::with_capacity(self.keys.len());
+        key: &mut Vec<FastKeyValue>,
+    ) -> JitResult<bool> {
+        key.clear();
         for (key_index, expr) in self.keys.iter().enumerate() {
             match expr {
                 JitExpr::Column {
@@ -427,10 +430,10 @@ impl GroupAggregateKernel {
                 JitExpr::Column { .. } => {
                     key.push(FastKeyValue::try_from_scalar(eval_expr(expr, view, row)?)?);
                 }
-                _ => return Ok(None),
+                _ => return Ok(false),
             }
         }
-        Ok(Some(key))
+        Ok(true)
     }
 }
 
