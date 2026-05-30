@@ -278,8 +278,16 @@ impl Database {
         schema: ArrowSchemaRef,
         batches: Vec<RecordBatch>,
     ) -> QuillSQLResult<()> {
-        let table_provider =
-            MemTable::try_new(schema, vec![batches]).map_err(map_datafusion_err)?;
+        self.register_partitions(table, schema, vec![batches])
+    }
+
+    pub fn register_partitions(
+        &self,
+        table: &str,
+        schema: ArrowSchemaRef,
+        partitions: Vec<Vec<RecordBatch>>,
+    ) -> QuillSQLResult<()> {
+        let table_provider = MemTable::try_new(schema, partitions).map_err(map_datafusion_err)?;
         self.ctx
             .register_table(table, Arc::new(table_provider))
             .map(|_| ())

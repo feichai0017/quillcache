@@ -59,10 +59,16 @@ impl MlirBackend {
 
     pub fn lower_group_aggregate_update(
         &self,
+        predicate: Option<&JitExpr>,
         keys: &[JitExpr],
         aggregates: &[GroupAggregate],
     ) -> JitResult<MlirModule> {
-        let pipeline = PipelineGraph::group_aggregate(vec![], keys.to_vec(), aggregates.to_vec());
+        let stages = predicate
+            .cloned()
+            .map(crate::PipelineStage::Filter)
+            .into_iter()
+            .collect();
+        let pipeline = PipelineGraph::group_aggregate(stages, keys.to_vec(), aggregates.to_vec());
         let dialect =
             self.emit_quill_dialect(emit::next_symbol("quill_group_aggregate"), &pipeline);
         lower::lower_quill_dialect(&dialect)
@@ -139,11 +145,12 @@ impl MlirBackend {
 
     pub fn compile_group_aggregate_update(
         &self,
+        predicate: Option<&JitExpr>,
         keys: &[JitExpr],
         aggregates: &[GroupAggregate],
     ) -> JitResult<CompiledGroupAggregateUpdate> {
         let spec =
-            crate::PipelineSpec::group_aggregate(None, keys, aggregates).ok_or_else(|| {
+            crate::PipelineSpec::group_aggregate(predicate, keys, aggregates).ok_or_else(|| {
                 crate::JitError::UnsupportedExpr(
                     "group aggregate update requires fixed-width aggregate state".to_string(),
                 )
@@ -157,7 +164,7 @@ impl MlirBackend {
         else {
             unreachable!("group_aggregate returned another spec")
         };
-        let module = self.lower_group_aggregate_update(keys, aggregates)?;
+        let module = self.lower_group_aggregate_update(predicate, keys, aggregates)?;
         self.verify_module(&module)?;
         compiled::compile_group_aggregate_update(&module, columns, aggregate_funcs, state_types)
     }

@@ -119,6 +119,21 @@ static mlir::LogicalResult cloneRegionValue(
   return mlir::success();
 }
 
+static bool isLiteralTrueFilter(mlir::quill::FilterOp filter) {
+  if (!filter || !llvm::hasSingleElement(filter.getPredicate()))
+    return false;
+  mlir::Block &block = filter.getPredicate().front();
+  auto yield = llvm::dyn_cast<mlir::quill::YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return false;
+  auto constant =
+      yield.getValues().front().getDefiningOp<mlir::arith::ConstantOp>();
+  if (!constant)
+    return false;
+  auto value = llvm::dyn_cast<mlir::BoolAttr>(constant.getValue());
+  return value && value.getValue();
+}
+
 static mlir::LogicalResult lowerFilterProject(mlir::func::FuncOp func) {
   if (func.isExternal() || !llvm::hasSingleElement(func.getBody()))
     return mlir::failure();
@@ -611,8 +626,14 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
   });
   if (!sink)
     return mlir::failure();
+  auto filter =
+      sink.getSelection().getDefiningOp<mlir::quill::FilterOp>();
 
   std::map<int64_t, mlir::Type> columnTypes;
+  if (filter && !isLiteralTrueFilter(filter) &&
+      mlir::failed(collectColumns(filter.getPredicate(), columnTypes, filter,
+                                  false)))
+    return mlir::failure();
   if (mlir::failed(
           collectColumns(sink.getState(), columnTypes, sink, false)))
     return mlir::failure();
@@ -638,11 +659,19 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
   mlir::Region stateRegion;
   mlir::IRMapping stateMapping;
   sink.getState().cloneInto(&stateRegion, stateMapping);
+  mlir::Region predicateRegion;
+  bool hasPredicate = false;
+  if (filter && !isLiteralTrueFilter(filter)) {
+    mlir::IRMapping predicateMapping;
+    filter.getPredicate().cloneInto(&predicateRegion, predicateMapping);
+    hasPredicate = true;
+  }
 
   mlir::MLIRContext *context = func.getContext();
   mlir::OpBuilder builder(context);
   mlir::Location loc = func.getLoc();
   auto i64Type = builder.getI64Type();
+  auto i8Type = builder.getI8Type();
   auto i32Type = builder.getI32Type();
   auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
 
@@ -656,6 +685,7 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
 
   llvm::SmallVector<mlir::Type> inputTypes;
   inputTypes.push_back(i64Type);
+  inputTypes.push_back(ptrType);
   inputTypes.push_back(ptrType);
   for (size_t i = 0; i < columnTypes.size(); ++i)
     inputTypes.push_back(ptrType);
@@ -672,8 +702,9 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
 
   mlir::Value len = entry->getArgument(0);
   mlir::Value groupIds = entry->getArgument(1);
+  mlir::Value touched = entry->getArgument(2);
   llvm::SmallVector<ColumnInfo> columns;
-  size_t argIndex = 2;
+  size_t argIndex = 3;
   for (const auto &[index, type] : columnTypes)
     columns.push_back(ColumnInfo{index, type, entry->getArgument(argIndex++)});
 
@@ -702,14 +733,26 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
         mlir::Value selected = bodyBuilder.create<mlir::arith::CmpIOp>(
             bodyLoc, mlir::arith::CmpIPredicate::sge, groupId, zeroI64);
 
-        auto branch = bodyBuilder.create<mlir::scf::IfOp>(
-            bodyLoc, mlir::TypeRange{i32Type}, selected, true);
-        mlir::OpBuilder thenBuilder = branch.getThenBodyBuilder();
-
         llvm::DenseMap<int64_t, mlir::Value> loadedColumns;
         for (const ColumnInfo &column : columns)
           loadedColumns.try_emplace(column.index,
-                                    loadColumn(thenBuilder, bodyLoc, iv, column));
+                                    loadColumn(bodyBuilder, bodyLoc, iv, column));
+        if (hasPredicate) {
+          mlir::Value predicate;
+          if (mlir::failed(cloneRegionValue(bodyBuilder, predicateRegion,
+                                            loadedColumns, func.getOperation(),
+                                            predicate))) {
+            cloneFailed = true;
+            bodyBuilder.create<mlir::scf::YieldOp>(bodyLoc);
+            return;
+          }
+          selected = bodyBuilder.create<mlir::arith::AndIOp>(bodyLoc, selected,
+                                                             predicate);
+        }
+
+        auto branch = bodyBuilder.create<mlir::scf::IfOp>(
+            bodyLoc, mlir::TypeRange{i32Type}, selected, true);
+        mlir::OpBuilder thenBuilder = branch.getThenBodyBuilder();
 
         llvm::SmallVector<mlir::Value> measures;
         if (mlir::failed(cloneRegionValues(thenBuilder, stateRegion,
@@ -735,6 +778,14 @@ static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
         }
         if (stateIndex != states.size())
           updateFailed = true;
+
+        auto touchedPtr = thenBuilder.create<mlir::LLVM::GEPOp>(
+            bodyLoc, ptrType, i8Type, touched,
+            llvm::SmallVector<mlir::LLVM::GEPArg>{groupId});
+        mlir::Value touchedValue =
+            thenBuilder.create<mlir::arith::ConstantIntOp>(bodyLoc, 1, 8);
+        thenBuilder.create<mlir::LLVM::StoreOp>(bodyLoc, touchedValue,
+                                                touchedPtr);
 
         mlir::Value zeroI32 =
             thenBuilder.create<mlir::arith::ConstantIntOp>(bodyLoc, 0, 32);

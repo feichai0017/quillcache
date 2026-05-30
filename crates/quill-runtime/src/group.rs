@@ -6,8 +6,8 @@ use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use quill_plan::{
-    AggregateFunc, GroupAggregate, JitBinaryOp, JitError, JitExpr, JitResult, JitScalar, JitType,
-    PipelineStage,
+    AggregateFunc, GroupAggregate, GroupAggregateOutputMode, JitBinaryOp, JitError, JitExpr,
+    JitResult, JitScalar, JitType, PipelineStage,
 };
 
 use super::array::{BatchView, OutputBuilder};
@@ -21,6 +21,7 @@ pub struct GroupAggregateKernel {
     keys: Vec<JitExpr>,
     aggregates: Vec<GroupAggregate>,
     schema: ArrowSchemaRef,
+    output_mode: GroupAggregateOutputMode,
     fast_key_plan: FastKeyPlan,
 }
 
@@ -42,6 +43,7 @@ pub struct GroupAggregateBatchBinding {
 #[derive(Debug, Clone)]
 pub struct GroupAggregateDenseState {
     fields: Vec<GroupAggregateStateField>,
+    touched: Vec<u8>,
     group_count: usize,
 }
 
@@ -70,6 +72,7 @@ pub enum GroupAggregateStateField {
 #[derive(Debug, Clone)]
 struct GroupState {
     key: GroupKey,
+    active: bool,
     aggregates: Vec<AggregateState>,
 }
 
@@ -208,6 +211,22 @@ impl GroupAggregateKernel {
         aggregates: Vec<GroupAggregate>,
         schema: ArrowSchemaRef,
     ) -> JitResult<Self> {
+        Self::try_new_with_output(
+            stages,
+            keys,
+            aggregates,
+            schema,
+            GroupAggregateOutputMode::PartialState,
+        )
+    }
+
+    pub fn try_new_with_output(
+        stages: &[PipelineStage],
+        keys: Vec<JitExpr>,
+        aggregates: Vec<GroupAggregate>,
+        schema: ArrowSchemaRef,
+        output_mode: GroupAggregateOutputMode,
+    ) -> JitResult<Self> {
         let predicate = match stages {
             [] => None,
             [PipelineStage::Filter(predicate)] => Some(predicate.clone()),
@@ -222,15 +241,20 @@ impl GroupAggregateKernel {
                 "group aggregate requires at least one key and one aggregate".to_string(),
             ));
         }
-        let aggregate_fields = aggregates
-            .iter()
-            .map(|aggregate| aggregate.state_types.len())
-            .sum::<usize>();
-        if schema.fields().len() != keys.len() + aggregate_fields {
+        let aggregate_fields = match output_mode {
+            GroupAggregateOutputMode::PartialState => aggregates
+                .iter()
+                .map(|aggregate| aggregate.state_types.len())
+                .sum::<usize>(),
+            GroupAggregateOutputMode::FinalValues => aggregates.len(),
+        };
+        let expected_fields = keys.len() + aggregate_fields;
+        if schema.fields().len() != expected_fields {
             return Err(JitError::Backend(format!(
-                "group aggregate output schema has {} fields, expected {}",
+                "group aggregate {} output schema has {} fields, expected {}",
+                output_mode.name(),
                 schema.fields().len(),
-                keys.len() + aggregate_fields
+                expected_fields
             )));
         }
         if let Some(predicate) = &predicate {
@@ -257,6 +281,7 @@ impl GroupAggregateKernel {
             keys,
             aggregates,
             schema,
+            output_mode,
         })
     }
 
@@ -270,6 +295,10 @@ impl GroupAggregateKernel {
 
     pub fn aggregates(&self) -> &[GroupAggregate] {
         &self.aggregates
+    }
+
+    pub fn output_mode(&self) -> GroupAggregateOutputMode {
+        self.output_mode
     }
 
     pub fn stage_names(&self) -> &'static str {
@@ -297,9 +326,20 @@ impl GroupAggregateKernel {
     ) -> JitResult<GroupAggregateBatchBinding> {
         let view = BatchView::try_new(batch)?;
         match &self.predicate_plan {
-            PredicatePlan::None => self.bind_batch_without_filter(state, &view, batch.num_rows()),
+            PredicatePlan::None => {
+                self.bind_batch_without_filter(state, &view, batch.num_rows(), true)
+            }
             predicate => self.bind_batch_with_filter(predicate, state, &view, batch.num_rows()),
         }
+    }
+
+    pub fn bind_batch_keys(
+        &self,
+        state: &mut GroupAggregateState,
+        batch: &RecordBatch,
+    ) -> JitResult<GroupAggregateBatchBinding> {
+        let view = BatchView::try_new(batch)?;
+        self.bind_batch_without_filter(state, &view, batch.num_rows(), false)
     }
 
     #[inline(always)]
@@ -308,12 +348,14 @@ impl GroupAggregateKernel {
         state: &mut GroupAggregateState,
         view: &BatchView<'_>,
         row_count: usize,
+        active_on_insert: bool,
     ) -> JitResult<GroupAggregateBatchBinding> {
         let mut group_ids = Vec::with_capacity(row_count);
         let mut fast_key = Vec::with_capacity(self.keys.len());
 
         for row in 0..row_count {
-            let group_id = self.group_id_for_row(state, view, row, &mut fast_key)?;
+            let group_id =
+                self.group_id_for_row(state, view, row, &mut fast_key, active_on_insert)?;
             let group_id = i64::try_from(group_id)
                 .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
             group_ids.push(group_id);
@@ -343,7 +385,7 @@ impl GroupAggregateKernel {
                 continue;
             }
 
-            let group_id = self.group_id_for_row(state, view, row, &mut fast_key)?;
+            let group_id = self.group_id_for_row(state, view, row, &mut fast_key, true)?;
             let group_id = i64::try_from(group_id)
                 .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
             group_ids.push(group_id);
@@ -378,7 +420,9 @@ impl GroupAggregateKernel {
             }
             let group_id = usize::try_from(group_id)
                 .map_err(|_| JitError::Backend("negative group id".to_string()))?;
-            let aggregates = &mut state.groups[group_id].aggregates;
+            let group = &mut state.groups[group_id];
+            group.active = true;
+            let aggregates = &mut group.aggregates;
             for (aggregate, aggregate_state) in self.aggregates.iter().zip(aggregates) {
                 let value = eval_expr(&aggregate.expr, &view, row)?;
                 aggregate_state.update(aggregate.func, value)?;
@@ -394,6 +438,10 @@ impl GroupAggregateKernel {
         state.dense_state_mut(&self.aggregates)
     }
 
+    pub fn ensure_dense_state(&self, state: &mut GroupAggregateState) -> JitResult<()> {
+        state.dense_state_mut(&self.aggregates).map(|_| ())
+    }
+
     pub fn flush_dense_state(&self, state: &mut GroupAggregateState) -> JitResult<()> {
         state.flush_dense_state(&self.aggregates)
     }
@@ -405,10 +453,20 @@ impl GroupAggregateKernel {
         self.finish_sparse_state(state)
     }
 
+    pub fn finish_final(&self, mut state: GroupAggregateState) -> JitResult<RecordBatch> {
+        if let Some(dense) = state.dense.take() {
+            return self.finish_dense_final_state(state, dense);
+        }
+        self.finish_sparse_final_state(state)
+    }
+
     fn finish_sparse_state(&self, state: GroupAggregateState) -> JitResult<RecordBatch> {
         let mut builders = self.output_builders(state.groups.len())?;
 
         for group in state.sorted_groups() {
+            if !group.active {
+                continue;
+            }
             for (value, builder) in group.key.0.into_iter().zip(&mut builders) {
                 builder.append(value.into_scalar())?;
             }
@@ -425,6 +483,38 @@ impl GroupAggregateKernel {
                     builder.append(value)?;
                     builder_index += 1;
                 }
+            }
+        }
+
+        let arrays = builders
+            .into_iter()
+            .map(OutputBuilder::finish)
+            .collect::<JitResult<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|err| JitError::Backend(err.to_string()))
+    }
+
+    fn finish_sparse_final_state(&self, state: GroupAggregateState) -> JitResult<RecordBatch> {
+        let mut builders = self.output_builders(state.groups.len())?;
+
+        for group in state.sorted_groups() {
+            if !group.active {
+                continue;
+            }
+            for (value, builder) in group.key.0.into_iter().zip(&mut builders) {
+                builder.append(value.into_scalar())?;
+            }
+            for (offset, (aggregate, state)) in
+                self.aggregates.iter().zip(group.aggregates).enumerate()
+            {
+                let builder_index = self.keys.len() + offset;
+                let builder = builders.get_mut(builder_index).ok_or_else(|| {
+                    JitError::Backend(format!(
+                        "missing final output builder for aggregate {}",
+                        aggregate.alias
+                    ))
+                })?;
+                builder.append(state.finish_value(aggregate)?)?;
             }
         }
 
@@ -459,6 +549,9 @@ impl GroupAggregateKernel {
                     "dense group id {group_id} out of bounds"
                 )));
             }
+            if !dense.is_touched(group_id)? {
+                continue;
+            }
             for (value, builder) in key.0.into_iter().zip(&mut builders) {
                 builder.append(value.into_scalar())?;
             }
@@ -479,6 +572,73 @@ impl GroupAggregateKernel {
                     field_index += 1;
                     builder_index += 1;
                 }
+            }
+            if field_index != dense.fields.len() {
+                return Err(JitError::Backend(format!(
+                    "dense state has {} fields, consumed {field_index}",
+                    dense.fields.len()
+                )));
+            }
+        }
+
+        let arrays = builders
+            .into_iter()
+            .map(OutputBuilder::finish)
+            .collect::<JitResult<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|err| JitError::Backend(err.to_string()))
+    }
+
+    fn finish_dense_final_state(
+        &self,
+        state: GroupAggregateState,
+        dense: GroupAggregateDenseState,
+    ) -> JitResult<RecordBatch> {
+        if dense.group_count != state.groups.len() {
+            return Err(JitError::Backend(format!(
+                "dense state has {} groups, runtime state has {}",
+                dense.group_count,
+                state.groups.len()
+            )));
+        }
+
+        let mut builders = self.output_builders(state.groups.len())?;
+        let mut sorted = state.group_ids.into_iter().collect::<Vec<_>>();
+        sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (key, group_id) in sorted {
+            if group_id >= state.groups.len() {
+                return Err(JitError::Backend(format!(
+                    "dense group id {group_id} out of bounds"
+                )));
+            }
+            if !dense.is_touched(group_id)? {
+                continue;
+            }
+            for (value, builder) in key.0.into_iter().zip(&mut builders) {
+                builder.append(value.into_scalar())?;
+            }
+
+            let mut field_index = 0_usize;
+            for (aggregate_index, aggregate) in self.aggregates.iter().enumerate() {
+                let mut values = Vec::with_capacity(aggregate.state_types.len());
+                for _ in &aggregate.state_types {
+                    let field = dense.fields.get(field_index).ok_or_else(|| {
+                        JitError::Backend("missing dense aggregate state field".to_string())
+                    })?;
+                    values.push(field.scalar(group_id)?);
+                    field_index += 1;
+                }
+                let builder_index = self.keys.len() + aggregate_index;
+                let builder = builders.get_mut(builder_index).ok_or_else(|| {
+                    JitError::Backend(format!(
+                        "missing final output builder for aggregate {}",
+                        aggregate.alias
+                    ))
+                })?;
+                builder.append(
+                    AggregateState::from_states(aggregate, values)?.finish_value(aggregate)?,
+                )?;
             }
             if field_index != dense.fields.len() {
                 return Err(JitError::Backend(format!(
@@ -518,6 +678,7 @@ impl GroupAggregateKernel {
         view: &BatchView<'_>,
         row: usize,
         fast_key: &mut Vec<FastKeyValue>,
+        active_on_insert: bool,
     ) -> JitResult<usize> {
         if self.fast_key_plan.bind_row(state, view, row, fast_key)? {
             if let Some(group_id) = state.fast_group_ids.get(fast_key.as_slice()) {
@@ -525,11 +686,16 @@ impl GroupAggregateKernel {
             }
 
             let key = self.eval_key(view, row)?;
-            return Ok(state.insert_group_with_fast_key(key, fast_key.clone(), &self.aggregates));
+            return Ok(state.insert_group_with_fast_key(
+                key,
+                fast_key.clone(),
+                &self.aggregates,
+                active_on_insert,
+            ));
         }
 
         let key = self.eval_key(view, row)?;
-        Ok(state.group_id(key, &self.aggregates))
+        Ok(state.group_id(key, &self.aggregates, active_on_insert))
     }
 }
 
@@ -544,12 +710,17 @@ impl GroupAggregateBatchBinding {
 }
 
 impl GroupAggregateState {
-    fn group_id(&mut self, key: GroupKey, aggregates: &[GroupAggregate]) -> usize {
+    fn group_id(
+        &mut self,
+        key: GroupKey,
+        aggregates: &[GroupAggregate],
+        active_on_insert: bool,
+    ) -> usize {
         if let Some(group_id) = self.group_ids.get(&key) {
             return *group_id;
         }
 
-        self.insert_group(key, aggregates)
+        self.insert_group(key, aggregates, active_on_insert)
     }
 
     fn insert_group_with_fast_key(
@@ -557,17 +728,24 @@ impl GroupAggregateState {
         key: GroupKey,
         fast_key: Vec<FastKeyValue>,
         aggregates: &[GroupAggregate],
+        active_on_insert: bool,
     ) -> usize {
-        let group_id = self.insert_group(key, aggregates);
+        let group_id = self.insert_group(key, aggregates, active_on_insert);
         self.fast_group_ids.insert(fast_key, group_id);
         group_id
     }
 
-    fn insert_group(&mut self, key: GroupKey, aggregates: &[GroupAggregate]) -> usize {
+    fn insert_group(
+        &mut self,
+        key: GroupKey,
+        aggregates: &[GroupAggregate],
+        active_on_insert: bool,
+    ) -> usize {
         let group_id = self.groups.len();
         self.group_ids.insert(key.clone(), group_id);
         self.groups.push(GroupState {
             key,
+            active: active_on_insert,
             aggregates: aggregates.iter().map(AggregateState::empty).collect(),
         });
         if let Some(dense) = &mut self.dense {
@@ -638,6 +816,11 @@ impl GroupAggregateState {
 
         Ok(GroupAggregateDenseState {
             fields,
+            touched: self
+                .groups
+                .iter()
+                .map(|group| u8::from(group.active))
+                .collect(),
             group_count,
         })
     }
@@ -656,6 +839,7 @@ impl GroupAggregateState {
         }
 
         for (group_id, group) in self.groups.iter_mut().enumerate() {
+            group.active |= dense.is_touched(group_id)?;
             let mut field_index = 0_usize;
             for (aggregate, state) in aggregates.iter().zip(&mut group.aggregates) {
                 let mut values = Vec::with_capacity(aggregate.state_types.len());
@@ -1123,6 +1307,12 @@ impl AggregateState {
         }
     }
 
+    fn from_states(aggregate: &GroupAggregate, values: Vec<Scalar>) -> JitResult<Self> {
+        let mut state = Self::empty(aggregate);
+        state.replace_states(aggregate, values)?;
+        Ok(state)
+    }
+
     fn update(&mut self, func: AggregateFunc, value: Scalar) -> JitResult<()> {
         match (self, func) {
             (Self::Sum(sum), AggregateFunc::Sum) => {
@@ -1192,6 +1382,31 @@ impl AggregateState {
                     value.unwrap_or_else(|| null_scalar(ty)),
                     ty,
                 )?])
+            }
+            (_, other) => Err(JitError::Backend(format!(
+                "aggregate state does not match function {}",
+                other.name()
+            ))),
+        }
+    }
+
+    fn finish_value(self, aggregate: &GroupAggregate) -> JitResult<Scalar> {
+        match (self, aggregate.func) {
+            (Self::Sum(value), AggregateFunc::Sum) => coerce_scalar(
+                value.unwrap_or_else(|| null_scalar(aggregate.output_type)),
+                aggregate.output_type,
+            ),
+            (Self::Count(value), AggregateFunc::Count) => {
+                coerce_scalar(Scalar::Int64(Some(value)), aggregate.output_type)
+            }
+            (Self::Avg { sum, count }, AggregateFunc::Avg) => {
+                finish_avg_value(sum, count, aggregate.output_type)
+            }
+            (Self::Min(value), AggregateFunc::Min) | (Self::Max(value), AggregateFunc::Max) => {
+                coerce_scalar(
+                    value.unwrap_or_else(|| null_scalar(aggregate.output_type)),
+                    aggregate.output_type,
+                )
             }
             (_, other) => Err(JitError::Backend(format!(
                 "aggregate state does not match function {}",
@@ -1280,6 +1495,23 @@ impl GroupAggregateDenseState {
         self.group_count
     }
 
+    pub fn touched_mut(&mut self) -> &mut [u8] {
+        &mut self.touched
+    }
+
+    pub fn update_parts_mut(&mut self) -> (&mut [u8], &mut [GroupAggregateStateField]) {
+        (&mut self.touched, &mut self.fields)
+    }
+
+    fn is_touched(&self, group_id: usize) -> JitResult<bool> {
+        self.touched
+            .get(group_id)
+            .map(|value| *value != 0)
+            .ok_or_else(|| {
+                JitError::Backend(format!("dense touched index {group_id} out of bounds"))
+            })
+    }
+
     fn push_empty(&mut self, aggregates: &[GroupAggregate]) {
         for (field, ty) in self.fields.iter_mut().zip(
             aggregates
@@ -1289,6 +1521,7 @@ impl GroupAggregateDenseState {
             debug_assert_eq!(field.ty(), *ty);
             field.push_null();
         }
+        self.touched.push(0);
         self.group_count += 1;
     }
 }
@@ -1567,6 +1800,13 @@ fn null_scalar(ty: JitType) -> Scalar {
 fn coerce_scalar(value: Scalar, ty: JitType) -> JitResult<Scalar> {
     match (value, ty) {
         (Scalar::Int32(value), JitType::Int64) => Ok(Scalar::Int64(value.map(i64::from))),
+        (Scalar::Int32(value), JitType::Float64) => Ok(Scalar::Float64(value.map(f64::from))),
+        (Scalar::Int64(value), JitType::Float64) => {
+            Ok(Scalar::Float64(value.map(|value| value as f64)))
+        }
+        (Scalar::UInt64(value), JitType::Float64) => {
+            Ok(Scalar::Float64(value.map(|value| value as f64)))
+        }
         (Scalar::Int64(value), JitType::UInt64) => {
             let value = value.map(u64::try_from).transpose().map_err(|_| {
                 JitError::Backend("negative count cannot coerce to UInt64".to_string())
@@ -1580,13 +1820,20 @@ fn coerce_scalar(value: Scalar, ty: JitType) -> JitResult<Scalar> {
                 .map_err(|_| JitError::Backend("UInt64 count does not fit in Int64".to_string()))?;
             Ok(Scalar::Int64(value))
         }
-        (Scalar::Decimal128 { value, .. }, JitType::Decimal128 { precision, scale }) => {
-            Ok(Scalar::Decimal128 {
+        (
+            Scalar::Decimal128 {
                 value,
-                precision,
-                scale,
-            })
-        }
+                scale: value_scale,
+                ..
+            },
+            JitType::Decimal128 { precision, scale },
+        ) => Ok(Scalar::Decimal128 {
+            value: value
+                .map(|value| rescale_decimal_value(value, value_scale, scale))
+                .transpose()?,
+            precision,
+            scale,
+        }),
         (value, ty) if value.ty() == ty => Ok(value),
         (value, ty) => Err(JitError::Backend(format!(
             "cannot coerce aggregate value {:?} to {:?}",
@@ -1594,6 +1841,86 @@ fn coerce_scalar(value: Scalar, ty: JitType) -> JitResult<Scalar> {
             ty
         ))),
     }
+}
+
+fn finish_avg_value(sum: Option<Scalar>, count: u64, output_type: JitType) -> JitResult<Scalar> {
+    if count == 0 {
+        return Ok(null_scalar(output_type));
+    }
+    let Some(sum) = sum else {
+        return Ok(null_scalar(output_type));
+    };
+
+    match output_type {
+        JitType::Float64 => Ok(Scalar::Float64(Some(scalar_to_f64(&sum)? / count as f64))),
+        JitType::Decimal128 { precision, scale } => match sum {
+            Scalar::Decimal128 {
+                value: Some(value),
+                scale: sum_scale,
+                ..
+            } => Ok(Scalar::Decimal128 {
+                value: Some(rescale_decimal_value(value, sum_scale, scale)? / i128::from(count)),
+                precision,
+                scale,
+            }),
+            Scalar::Decimal128 { value: None, .. } => Ok(Scalar::Decimal128 {
+                value: None,
+                precision,
+                scale,
+            }),
+            other => Err(JitError::Backend(format!(
+                "cannot compute Decimal128 AVG from {:?}",
+                other.ty()
+            ))),
+        },
+        other => Err(JitError::UnsupportedType(format!(
+            "AVG final output type {other:?} is not supported"
+        ))),
+    }
+}
+
+fn scalar_to_f64(value: &Scalar) -> JitResult<f64> {
+    match value {
+        Scalar::Int32(Some(value)) => Ok(f64::from(*value)),
+        Scalar::Int64(Some(value)) => Ok(*value as f64),
+        Scalar::UInt64(Some(value)) => Ok(*value as f64),
+        Scalar::Float64(Some(value)) => Ok(*value),
+        Scalar::Int32(None)
+        | Scalar::Int64(None)
+        | Scalar::UInt64(None)
+        | Scalar::Float64(None) => Ok(0.0),
+        other => Err(JitError::Backend(format!(
+            "cannot compute Float64 AVG from {:?}",
+            other.ty()
+        ))),
+    }
+}
+
+fn rescale_decimal_value(value: i128, from_scale: i8, to_scale: i8) -> JitResult<i128> {
+    match to_scale.cmp(&from_scale) {
+        Ordering::Equal => Ok(value),
+        Ordering::Greater => {
+            let factor = decimal_scale_factor(to_scale - from_scale)?;
+            value.checked_mul(factor).ok_or_else(|| {
+                JitError::Backend("decimal rescale overflowed while increasing scale".to_string())
+            })
+        }
+        Ordering::Less => {
+            let factor = decimal_scale_factor(from_scale - to_scale)?;
+            Ok(value / factor)
+        }
+    }
+}
+
+fn decimal_scale_factor(delta: i8) -> JitResult<i128> {
+    if delta < 0 {
+        return Err(JitError::Backend(format!(
+            "negative decimal scale delta {delta}"
+        )));
+    }
+    10_i128
+        .checked_pow(u32::from(delta as u8))
+        .ok_or_else(|| JitError::Backend("decimal scale factor overflowed i128".to_string()))
 }
 
 fn set_option<T: Copy>(

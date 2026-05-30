@@ -7,6 +7,7 @@ use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -14,11 +15,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use serde::Serialize;
 
 use quill_plan::{
-    AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitResult, JitScalar, PipelineGraph,
-    PipelineKind, PipelineStage,
+    AggregateFunc, GroupAggregate, GroupAggregateOutputMode, JitExpr, JitProjection, JitResult,
+    JitScalar, PipelineGraph, PipelineKind, PipelineStage,
 };
 
-use crate::{CompiledPipelineExec, PipelineRuntime};
+use crate::{CompiledGlobalGroupAggregateExec, CompiledPipelineExec, PipelineRuntime};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PipelineMatch {
@@ -36,6 +37,7 @@ pub struct PipelineCandidate {
     pub source: &'static str,
     pub stages: Vec<&'static str>,
     pub sink: &'static str,
+    pub output_mode: Option<&'static str>,
     pub compiled: bool,
     pub backend: Option<String>,
     pub reason: &'static str,
@@ -47,6 +49,13 @@ pub(crate) struct PhysicalPipeline {
     pub output_schema: ArrowSchemaRef,
     pub graph: PipelineGraph,
     pub output_adapter: Option<OutputAdapter>,
+    pub execution: PipelineExecution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineExecution {
+    PartitionLocal,
+    Global,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +72,7 @@ impl PipelineMatch {
             source: self.graph.source.name(),
             stages: self.graph.stage_names(),
             sink: self.graph.sink_name(),
+            output_mode: group_output_mode(&self.graph),
             compiled: self.compiled,
             backend: self.backend.clone(),
             reason: self.reason,
@@ -82,6 +92,7 @@ impl PhysicalPipeline {
             output_schema,
             graph: PipelineGraph::filter_sum(predicate, measure),
             output_adapter: None,
+            execution: PipelineExecution::PartitionLocal,
         }
     }
 
@@ -100,6 +111,7 @@ impl PhysicalPipeline {
                 PipelineStage::Projection(projections),
             ]),
             output_adapter,
+            execution: PipelineExecution::PartitionLocal,
         }
     }
 
@@ -113,6 +125,21 @@ impl PhysicalPipeline {
             output_schema,
             graph,
             output_adapter: None,
+            execution: PipelineExecution::PartitionLocal,
+        }
+    }
+
+    pub fn global_group_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        output_schema: ArrowSchemaRef,
+        graph: PipelineGraph,
+    ) -> Self {
+        Self {
+            input,
+            output_schema,
+            graph,
+            output_adapter: None,
+            execution: PipelineExecution::Global,
         }
     }
 }
@@ -121,7 +148,8 @@ pub(crate) fn extract_pipeline_from_node(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<PhysicalPipeline> {
     if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
-        return extract_filter_sum_pipeline(aggregate)
+        return extract_global_group_aggregate_pipeline(aggregate)
+            .or_else(|| extract_filter_sum_pipeline(aggregate))
             .or_else(|| extract_group_aggregate_pipeline(aggregate));
     }
 
@@ -130,6 +158,30 @@ pub(crate) fn extract_pipeline_from_node(
 }
 
 pub(crate) fn pipeline_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<PipelineMatch> {
+    if let Some(compiled) = plan
+        .as_any()
+        .downcast_ref::<CompiledGlobalGroupAggregateExec>()
+    {
+        let graph = PipelineGraph::group_aggregate_final(
+            compiled
+                .runtime()
+                .predicate()
+                .cloned()
+                .map(PipelineStage::Filter)
+                .into_iter()
+                .collect(),
+            compiled.runtime().keys().to_vec(),
+            compiled.runtime().aggregates().to_vec(),
+        );
+        return Some(PipelineMatch {
+            node: "CompiledGlobalGroupAggregateExec",
+            graph,
+            compiled: true,
+            backend: Some(compiled.kernel().backend.clone()),
+            reason: "compiled",
+        });
+    }
+
     if let Some(compiled) = plan.as_any().downcast_ref::<CompiledPipelineExec>() {
         let graph = match compiled.runtime() {
             PipelineRuntime::RecordBatch(runtime) => PipelineGraph::record(vec![
@@ -177,6 +229,13 @@ pub(crate) fn pipeline_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<Pipeli
         backend: None,
         reason: "candidate",
     })
+}
+
+fn group_output_mode(graph: &PipelineGraph) -> Option<&'static str> {
+    match &graph.sink {
+        quill_plan::PipelineSink::GroupAggregate { output, .. } => Some(output.name()),
+        quill_plan::PipelineSink::RecordBatch | quill_plan::PipelineSink::Sum { .. } => None,
+    }
 }
 
 fn extract_filter_project_pipeline(projection: &ProjectionExec) -> Option<PhysicalPipeline> {
@@ -312,6 +371,124 @@ fn extract_group_aggregate_pipeline(aggregate: &AggregateExec) -> Option<Physica
     ))
 }
 
+fn extract_global_group_aggregate_pipeline(aggregate: &AggregateExec) -> Option<PhysicalPipeline> {
+    match aggregate.mode() {
+        AggregateMode::Single | AggregateMode::SinglePartitioned => {
+            extract_single_global_group_aggregate_pipeline(aggregate)
+        }
+        AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            extract_final_global_group_aggregate_pipeline(aggregate)
+        }
+        AggregateMode::Partial | AggregateMode::PartialReduce => None,
+    }
+}
+
+fn extract_single_global_group_aggregate_pipeline(
+    aggregate: &AggregateExec,
+) -> Option<PhysicalPipeline> {
+    if aggregate.group_expr().is_true_no_grouping()
+        || !aggregate.group_expr().is_single()
+        || aggregate.group_expr().groups().len() != 1
+        || aggregate
+            .group_expr()
+            .groups()
+            .first()
+            .is_some_and(|group| group.iter().any(|is_null| *is_null))
+        || aggregate.aggr_expr().is_empty()
+        || aggregate.filter_expr().iter().any(Option::is_some)
+    {
+        return None;
+    }
+
+    let input = strip_pipeline_adapters(aggregate.input());
+    let (input, stages, projection) =
+        if let Some(filter) = input.as_any().downcast_ref::<FilterExec>() {
+            if filter.fetch().is_some() {
+                return None;
+            }
+            let predicate =
+                crate::expr::from_physical(filter.predicate(), filter.input().schema().as_ref())
+                    .ok()?;
+            (
+                filter.input(),
+                vec![PipelineStage::Filter(predicate)],
+                filter.projection().as_ref().map(AsRef::as_ref),
+            )
+        } else {
+            (input, Vec::new(), None)
+        };
+
+    let aggregate_input_schema = aggregate.input().schema();
+    let input_schema = input.schema();
+    let keys = lower_group_keys(
+        aggregate,
+        aggregate_input_schema.as_ref(),
+        projection,
+        input_schema.as_ref(),
+    )?;
+    let aggregates = lower_group_aggregates_with_output(
+        aggregate,
+        aggregate_input_schema.as_ref(),
+        projection,
+        input_schema.as_ref(),
+        GroupAggregateOutputMode::FinalValues,
+    )?;
+
+    let graph = PipelineGraph::group_aggregate_final(stages, keys, aggregates);
+    Some(PhysicalPipeline::global_group_aggregate(
+        Arc::clone(input),
+        aggregate.schema(),
+        graph,
+    ))
+}
+
+fn extract_final_global_group_aggregate_pipeline(
+    aggregate: &AggregateExec,
+) -> Option<PhysicalPipeline> {
+    if aggregate.group_expr().is_true_no_grouping()
+        || aggregate.aggr_expr().is_empty()
+        || aggregate.filter_expr().iter().any(Option::is_some)
+    {
+        return None;
+    }
+    if aggregate.aggr_expr().iter().any(|expr| {
+        expr.is_distinct()
+            || !expr.order_bys().is_empty()
+            || aggregate_func(expr.fun().name()).is_none()
+    }) {
+        return None;
+    }
+
+    let compiled = strip_final_group_adapters(aggregate.input())?;
+    let PipelineRuntime::GroupAggregate(runtime) = compiled.runtime() else {
+        return None;
+    };
+    if runtime.output_mode() != GroupAggregateOutputMode::PartialState
+        || aggregate.aggr_expr().len() != runtime.aggregates().len()
+    {
+        return None;
+    }
+
+    let mut aggregates = runtime.aggregates().to_vec();
+    for (index, group_aggregate) in aggregates.iter_mut().enumerate() {
+        group_aggregate.output_type =
+            aggregate_output_type(&aggregate.schema(), runtime.keys().len(), index)?;
+    }
+
+    let stages = runtime
+        .predicate()
+        .cloned()
+        .map(PipelineStage::Filter)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let graph = PipelineGraph::group_aggregate_final(stages, runtime.keys().to_vec(), aggregates);
+    Some(PhysicalPipeline::global_group_aggregate(
+        Arc::clone(compiled.input()),
+        aggregate.schema(),
+        graph,
+    ))
+}
+
 fn lower_projection_exprs(
     projection: &ProjectionExec,
     input_schema: &ArrowSchema,
@@ -347,6 +524,23 @@ fn strip_pipeline_adapters(input: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Execution
     input
 }
 
+#[allow(deprecated)]
+fn strip_final_group_adapters(input: &Arc<dyn ExecutionPlan>) -> Option<&CompiledPipelineExec> {
+    if let Some(compiled) = input.as_any().downcast_ref::<CompiledPipelineExec>() {
+        return Some(compiled);
+    }
+    if let Some(coalesce) = input.as_any().downcast_ref::<CoalesceBatchesExec>() {
+        return strip_final_group_adapters(coalesce.input());
+    }
+    if let Some(coalesce) = input.as_any().downcast_ref::<CoalescePartitionsExec>() {
+        return strip_final_group_adapters(coalesce.input());
+    }
+    if let Some(repartition) = input.as_any().downcast_ref::<RepartitionExec>() {
+        return strip_final_group_adapters(repartition.input());
+    }
+    None
+}
+
 fn lower_group_keys(
     aggregate: &AggregateExec,
     aggregate_input_schema: &ArrowSchema,
@@ -370,10 +564,29 @@ fn lower_group_aggregates(
     projection: Option<&[usize]>,
     input_schema: &ArrowSchema,
 ) -> Option<Vec<GroupAggregate>> {
+    lower_group_aggregates_with_output(
+        aggregate,
+        aggregate_input_schema,
+        projection,
+        input_schema,
+        GroupAggregateOutputMode::PartialState,
+    )
+}
+
+fn lower_group_aggregates_with_output(
+    aggregate: &AggregateExec,
+    aggregate_input_schema: &ArrowSchema,
+    projection: Option<&[usize]>,
+    input_schema: &ArrowSchema,
+    output_mode: GroupAggregateOutputMode,
+) -> Option<Vec<GroupAggregate>> {
+    let key_count = aggregate.group_expr().expr().len();
     aggregate
         .aggr_expr()
         .iter()
+        .enumerate()
         .map(|expr| {
+            let (index, expr) = expr;
             if expr.is_distinct() || !expr.order_bys().is_empty() {
                 return None;
             }
@@ -396,14 +609,34 @@ fn lower_group_aggregates(
                 .iter()
                 .map(|field| crate::expr::jit_type(field.data_type()).ok())
                 .collect::<Option<Vec<_>>>()?;
-            Some(GroupAggregate::new_with_states(
+            let output_type = match output_mode {
+                GroupAggregateOutputMode::PartialState => {
+                    state_types.first().copied().unwrap_or_else(|| measure.ty())
+                }
+                GroupAggregateOutputMode::FinalValues => {
+                    aggregate_output_type(&aggregate.schema(), key_count, index)?
+                }
+            };
+            Some(GroupAggregate::new_with_output_and_states(
                 func,
                 measure,
+                output_type,
                 state_types,
                 expr.name().to_string(),
             ))
         })
         .collect()
+}
+
+fn aggregate_output_type(
+    schema: &ArrowSchemaRef,
+    key_count: usize,
+    aggregate_index: usize,
+) -> Option<quill_plan::JitType> {
+    schema
+        .fields()
+        .get(key_count + aggregate_index)
+        .and_then(|field| crate::expr::jit_type(field.data_type()).ok())
 }
 
 fn aggregate_func(name: &str) -> Option<AggregateFunc> {

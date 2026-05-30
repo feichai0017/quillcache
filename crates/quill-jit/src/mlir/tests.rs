@@ -447,7 +447,7 @@ fn invokes_compiled_group_aggregate_dense_update_kernel() {
         GroupAggregate::new(AggregateFunc::Max, value, JitType::Int64, "max_v"),
     ];
     let compiled = MlirBackend::new()
-        .compile_group_aggregate_update(&[key], &aggregates)
+        .compile_group_aggregate_update(None, &[key], &aggregates)
         .unwrap();
     let group_ids = [0_i64, 1, -1, 0];
     let values = [10_i64, 20, 30, 5];
@@ -459,6 +459,7 @@ fn invokes_compiled_group_aggregate_dense_update_kernel() {
         int64_state(2),
         int64_state(2),
     ];
+    let mut touched = vec![0_u8; 2];
 
     compiled
         .invoke(
@@ -467,16 +468,59 @@ fn invokes_compiled_group_aggregate_dense_update_kernel() {
                 index: 1,
                 values: &values,
             }],
+            &mut touched,
             &mut state_fields,
         )
         .unwrap();
 
+    assert_eq!(touched, vec![1, 1]);
     assert_int64_state(&state_fields[0], &[15, 20], &[1, 1]);
     assert_int64_state(&state_fields[1], &[2, 1], &[1, 1]);
     assert_uint64_state(&state_fields[2], &[2, 1], &[1, 1]);
     assert_int64_state(&state_fields[3], &[15, 20], &[1, 1]);
     assert_int64_state(&state_fields[4], &[5, 20], &[1, 1]);
     assert_int64_state(&state_fields[5], &[10, 20], &[1, 1]);
+}
+
+#[test]
+fn invokes_compiled_group_aggregate_with_predicate() {
+    let key = int64_col(0, "k");
+    let value = int64_col(1, "v");
+    let predicate = JitExpr::Binary {
+        op: JitBinaryOp::Lt,
+        left: Box::new(value.clone()),
+        right: Box::new(JitExpr::Literal(JitScalar::Int64(30))),
+        ty: JitType::Bool,
+        nullable: false,
+    };
+    let aggregates = vec![GroupAggregate::new(
+        AggregateFunc::Sum,
+        value,
+        JitType::Int64,
+        "sum_v",
+    )];
+    let compiled = MlirBackend::new()
+        .compile_group_aggregate_update(Some(&predicate), &[key], &aggregates)
+        .unwrap();
+    let group_ids = [0_i64, 1, 0, 1];
+    let values = [10_i64, 35, 30, 40];
+    let mut touched = vec![0_u8; 2];
+    let mut state_fields = vec![int64_state(2)];
+
+    compiled
+        .invoke(
+            &group_ids,
+            &[FixedColumnInput::Int64 {
+                index: 1,
+                values: &values,
+            }],
+            &mut touched,
+            &mut state_fields,
+        )
+        .unwrap();
+
+    assert_eq!(touched, vec![1, 0]);
+    assert_int64_state(&state_fields[0], &[10, 0], &[1, 0]);
 }
 
 fn i64_gt_ten(nullable: bool) -> JitExpr {

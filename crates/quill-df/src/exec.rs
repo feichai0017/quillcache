@@ -37,6 +37,15 @@ pub struct CompiledPipelineExec {
     cache: Arc<PlanProperties>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompiledGlobalGroupAggregateExec {
+    input: Arc<dyn ExecutionPlan>,
+    runtime: GroupAggregateKernel,
+    kernel: CompiledKernel,
+    schema: ArrowSchemaRef,
+    cache: Arc<PlanProperties>,
+}
+
 impl PipelineRuntime {
     fn expected_kernel(&self) -> KernelKind {
         match self {
@@ -167,22 +176,57 @@ impl CompiledPipelineExec {
         state: &mut GroupAggregateState,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let binding = runtime
-            .bind_batch(state, batch)
-            .map_err(crate::map_jit_err)?;
-        if quill_jit::execute_group_aggregate_update(&self.kernel, runtime, &binding, state, batch)
-            .map_err(crate::map_jit_err)?
-            .is_some()
-        {
-            return Ok(());
-        }
+        accumulate_group_aggregate_batch(&self.kernel, runtime, state, batch)
+    }
+}
 
-        runtime
-            .flush_dense_state(state)
-            .map_err(crate::map_jit_err)?;
-        runtime
-            .accumulate_bound(state, batch, &binding)
-            .map_err(crate::map_jit_err)
+impl CompiledGlobalGroupAggregateExec {
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        runtime: GroupAggregateKernel,
+        schema: ArrowSchemaRef,
+        kernel: CompiledKernel,
+    ) -> Result<Self> {
+        if kernel.kind != KernelKind::GroupAggregate {
+            return Err(DataFusionError::Internal(format!(
+                "expected group aggregate kernel, got {:?}",
+                kernel.kind
+            )));
+        }
+        let cache = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            input.properties().emission_type,
+            input.properties().boundedness,
+        ));
+
+        Ok(Self {
+            input,
+            runtime,
+            kernel,
+            schema,
+            cache,
+        })
+    }
+
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    pub fn kernel(&self) -> &CompiledKernel {
+        &self.kernel
+    }
+
+    pub fn runtime(&self) -> &GroupAggregateKernel {
+        &self.runtime
+    }
+
+    pub fn stage_names(&self) -> &'static str {
+        self.runtime.stage_names()
+    }
+
+    pub fn sink_name(&self) -> &'static str {
+        "group_aggregate"
     }
 }
 
@@ -353,6 +397,110 @@ impl ExecutionPlan for CompiledPipelineExec {
     }
 }
 
+impl DisplayAs for CompiledGlobalGroupAggregateExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "CompiledGlobalGroupAggregateExec: kind=aggregate, stages={}, sink={}, mode={}, backend={}, executable={}, keys={}, aggregates={}",
+                    self.stage_names(),
+                    self.sink_name(),
+                    self.runtime.output_mode().name(),
+                    self.kernel.backend,
+                    self.kernel.executable,
+                    self.runtime.keys().len(),
+                    self.runtime.aggregates().len()
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                writeln!(
+                    f,
+                    "kind=aggregate, stages={}, sink={}, mode={}, backend={}, executable={}",
+                    self.stage_names(),
+                    self.sink_name(),
+                    self.runtime.output_mode().name(),
+                    self.kernel.backend,
+                    self.kernel.executable
+                )?;
+                writeln!(f, "keys={}", self.runtime.keys().len())?;
+                writeln!(f, "aggregates={}", self.runtime.aggregates().len())
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for CompiledGlobalGroupAggregateExec {
+    fn name(&self) -> &str {
+        "CompiledGlobalGroupAggregateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "CompiledGlobalGroupAggregateExec expected one child, got {}",
+                children.len()
+            )));
+        }
+
+        Self::try_new(
+            children.swap_remove(0),
+            self.runtime.clone(),
+            Arc::clone(&self.schema),
+            self.kernel.clone(),
+        )
+        .map(|exec| Arc::new(exec) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "CompiledGlobalGroupAggregateExec has one output partition, got {partition}"
+            )));
+        }
+
+        Ok(Box::pin(CompiledGlobalGroupAggregateStream {
+            schema: Arc::clone(&self.schema),
+            input: Arc::clone(&self.input),
+            context,
+            current: None,
+            next_partition: 0,
+            input_partitions: self.input.properties().partitioning.partition_count(),
+            runtime: self.runtime.clone(),
+            kernel: self.kernel.clone(),
+            state: self.runtime.new_state(),
+            emitted: false,
+        }))
+    }
+}
+
 struct CompiledRecordPipelineStream {
     schema: ArrowSchemaRef,
     input: SendableRecordBatchStream,
@@ -371,6 +519,19 @@ struct CompiledGroupAggregateStream {
     schema: ArrowSchemaRef,
     input: SendableRecordBatchStream,
     exec: CompiledPipelineExec,
+    state: GroupAggregateState,
+    emitted: bool,
+}
+
+struct CompiledGlobalGroupAggregateStream {
+    schema: ArrowSchemaRef,
+    input: Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+    current: Option<SendableRecordBatchStream>,
+    next_partition: usize,
+    input_partitions: usize,
+    runtime: GroupAggregateKernel,
+    kernel: CompiledKernel,
     state: GroupAggregateState,
     emitted: bool,
 }
@@ -480,6 +641,60 @@ impl Stream for CompiledGroupAggregateStream {
     }
 }
 
+impl Stream for CompiledGlobalGroupAggregateStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.emitted {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            if let Some(input) = &mut self.current {
+                match ready!(input.poll_next_unpin(cx)) {
+                    Some(Ok(batch)) => {
+                        let runtime = self.runtime.clone();
+                        let kernel = self.kernel.clone();
+                        let mut state = std::mem::replace(&mut self.state, runtime.new_state());
+                        let result =
+                            accumulate_group_aggregate_batch(&kernel, &runtime, &mut state, &batch);
+                        self.state = state;
+                        if let Err(err) = result {
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                    }
+                    Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+                    None => {
+                        self.current = None;
+                    }
+                }
+                continue;
+            }
+
+            if self.next_partition < self.input_partitions {
+                match self
+                    .input
+                    .execute(self.next_partition, Arc::clone(&self.context))
+                {
+                    Ok(stream) => {
+                        self.current = Some(stream);
+                        self.next_partition += 1;
+                    }
+                    Err(err) => return Poll::Ready(Some(Err(err))),
+                }
+                continue;
+            }
+
+            self.emitted = true;
+            let runtime = self.runtime.clone();
+            let state = std::mem::replace(&mut self.state, runtime.new_state());
+            return Poll::Ready(Some(
+                runtime.finish_final(state).map_err(crate::map_jit_err),
+            ));
+        }
+    }
+}
+
 impl RecordBatchStream for CompiledRecordPipelineStream {
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.schema)
@@ -496,6 +711,36 @@ impl RecordBatchStream for CompiledGroupAggregateStream {
     fn schema(&self) -> ArrowSchemaRef {
         Arc::clone(&self.schema)
     }
+}
+
+impl RecordBatchStream for CompiledGlobalGroupAggregateStream {
+    fn schema(&self) -> ArrowSchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+fn accumulate_group_aggregate_batch(
+    kernel: &CompiledKernel,
+    runtime: &GroupAggregateKernel,
+    state: &mut GroupAggregateState,
+    batch: &RecordBatch,
+) -> Result<()> {
+    if quill_jit::execute_group_aggregate_update(kernel, runtime, state, batch)
+        .map_err(crate::map_jit_err)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let binding = runtime
+        .bind_batch(state, batch)
+        .map_err(crate::map_jit_err)?;
+    runtime
+        .flush_dense_state(state)
+        .map_err(crate::map_jit_err)?;
+    runtime
+        .accumulate_bound(state, batch, &binding)
+        .map_err(crate::map_jit_err)
 }
 
 fn finish_scalar_sum_batch(

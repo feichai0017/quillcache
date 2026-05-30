@@ -194,6 +194,7 @@ impl CompiledGroupAggregateUpdate {
         &self,
         group_ids: &[i64],
         inputs: &[FixedColumnInput<'_>],
+        touched: &mut [u8],
         state_fields: &mut [GroupAggregateStateField],
     ) -> JitResult<()> {
         if state_fields.len() != self.state_types.len() {
@@ -252,6 +253,12 @@ impl CompiledGroupAggregateUpdate {
         if let Some(max_group_id) = max_group_id {
             let max_group_id = usize::try_from(max_group_id)
                 .map_err(|_| JitError::Backend("group id does not fit in usize".to_string()))?;
+            if touched.len() <= max_group_id {
+                return Err(JitError::Backend(format!(
+                    "compiled group aggregate touched bitmap len {} cannot hold group id {max_group_id}",
+                    touched.len()
+                )));
+            }
             for (index, field) in state_fields.iter().enumerate() {
                 if field.len() <= max_group_id {
                     return Err(JitError::Backend(format!(
@@ -264,6 +271,7 @@ impl CompiledGroupAggregateUpdate {
 
         let mut len = group_ids.len() as i64;
         let mut group_ids_ptr = group_ids.as_ptr();
+        let mut touched_ptr = touched.as_mut_ptr();
         let mut state_ptrs = state_fields
             .iter_mut()
             .map(GroupAggregateStateField::values_ptr)
@@ -274,9 +282,10 @@ impl CompiledGroupAggregateUpdate {
             .collect::<Vec<_>>();
         let mut result = -1_i32;
         let mut packed_args =
-            Vec::with_capacity(2 + input_ptrs.len() + state_ptrs.len() + valid_ptrs.len() + 1);
+            Vec::with_capacity(3 + input_ptrs.len() + state_ptrs.len() + valid_ptrs.len() + 1);
         packed_args.push(&mut len as *mut i64 as *mut ());
         packed_args.push(&mut group_ids_ptr as *mut *const i64 as *mut ());
+        packed_args.push(&mut touched_ptr as *mut *mut u8 as *mut ());
         for ptr in &mut input_ptrs {
             packed_args.push(ptr as *mut *const () as *mut ());
         }

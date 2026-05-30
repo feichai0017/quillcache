@@ -80,7 +80,10 @@ fn extract_group_aggregate_lowering(graph: &PipelineGraph) -> Option<PipelineLow
         [PipelineStage::Filter(predicate)] => Some(predicate.clone()),
         _ => return None,
     };
-    let PipelineSink::GroupAggregate { keys, aggregates } = &graph.sink else {
+    let PipelineSink::GroupAggregate {
+        keys, aggregates, ..
+    } = &graph.sink
+    else {
         return None;
     };
     Some(PipelineLowering::GroupAggregate {

@@ -502,7 +502,9 @@ async fn group_aggregate_mlir_executes_dense_update_pipeline() {
 
     let trace = db.debug_last_trace().expect("trace");
     assert!(
-        trace.physical_plan.contains("CompiledPipelineExec"),
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
         "{}",
         trace.physical_plan
     );
@@ -510,14 +512,17 @@ async fn group_aggregate_mlir_executes_dense_update_pipeline() {
         trace
             .pipeline_candidates
             .iter()
-            .any(|candidate| candidate.node == "CompiledPipelineExec"
-                && candidate.kind == PipelineKind::Aggregate
-                && candidate.compiled
-                && candidate.source == "arrow_batch"
-                && candidate.stages == vec!["filter"]
-                && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("mlir")
-                && candidate.reason == "compiled"),
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.source == "arrow_batch"
+                    && candidate.stages == vec!["filter"]
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
         "{:?}",
         trace.pipeline_candidates
     );
@@ -555,7 +560,9 @@ async fn string_group_keys_use_mlir_dense_update_boundary() {
 
     let trace = db.debug_last_trace().expect("trace");
     assert!(
-        trace.physical_plan.contains("CompiledPipelineExec"),
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
         "{}",
         trace.physical_plan
     );
@@ -563,20 +570,92 @@ async fn string_group_keys_use_mlir_dense_update_boundary() {
         trace
             .pipeline_candidates
             .iter()
-            .any(|candidate| candidate.node == "CompiledPipelineExec"
-                && candidate.kind == PipelineKind::Aggregate
-                && candidate.compiled
-                && candidate.source == "arrow_batch"
-                && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("mlir")
-                && candidate.reason == "compiled"),
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.source == "arrow_batch"
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
         "{:?}",
         trace.pipeline_candidates
     );
 }
 
 #[tokio::test]
-async fn avg_group_aggregate_uses_partial_state_pipeline() {
+async fn global_group_aggregate_merges_input_partitions() {
+    let db = Database::new_temp().expect("database");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let left = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B"])),
+            Arc::new(Int64Array::from(vec![10, 30])),
+        ],
+    )
+    .expect("left batch");
+    let right = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A"])),
+            Arc::new(Int64Array::from(vec![20, 5])),
+        ],
+    )
+    .expect("right batch");
+    db.register_partitions("t", schema, vec![vec![left], vec![right]])
+        .expect("table");
+
+    assert_eq!(
+        rows(
+            db.run("select flag, sum(v) as sum_v, count(*) as count_v from t group by flag order by flag")
+                .await
+                .expect("query")
+        ),
+        vec![
+            vec!["A".to_string(), "35".to_string(), "3".to_string()],
+            vec!["B".to_string(), "30".to_string(), "1".to_string()],
+        ]
+    );
+
+    let trace = db.debug_last_trace().expect("trace");
+    assert!(
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
+        "{}",
+        trace.physical_plan
+    );
+    assert!(
+        trace.physical_plan.contains("DataSourceExec: partitions=2"),
+        "{}",
+        trace.physical_plan
+    );
+    assert!(
+        trace
+            .pipeline_candidates
+            .iter()
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
+        "{:?}",
+        trace.pipeline_candidates
+    );
+}
+
+#[tokio::test]
+async fn avg_group_aggregate_uses_global_final_pipeline() {
     let db = Database::new_temp().expect("database");
     let schema = Arc::new(Schema::new(vec![
         Field::new("flag", DataType::Utf8, false),
@@ -622,7 +701,9 @@ async fn avg_group_aggregate_uses_partial_state_pipeline() {
 
     let trace = db.debug_last_trace().expect("trace");
     assert!(
-        trace.physical_plan.contains("CompiledPipelineExec"),
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
         "{}",
         trace.physical_plan
     );
@@ -630,20 +711,23 @@ async fn avg_group_aggregate_uses_partial_state_pipeline() {
         trace
             .pipeline_candidates
             .iter()
-            .any(|candidate| candidate.node == "CompiledPipelineExec"
-                && candidate.kind == PipelineKind::Aggregate
-                && candidate.compiled
-                && candidate.source == "arrow_batch"
-                && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("mlir")
-                && candidate.reason == "compiled"),
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.source == "arrow_batch"
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
         "{:?}",
         trace.pipeline_candidates
     );
 }
 
 #[tokio::test]
-async fn q1_shaped_composite_group_aggregate_uses_partial_state_pipeline() {
+async fn q1_shaped_composite_group_aggregate_uses_global_final_pipeline() {
     let db = Database::new_temp().expect("database");
     let schema = Arc::new(Schema::new(vec![
         Field::new("returnflag", DataType::Utf8, false),
@@ -699,7 +783,9 @@ async fn q1_shaped_composite_group_aggregate_uses_partial_state_pipeline() {
 
     let trace = db.debug_last_trace().expect("trace");
     assert!(
-        trace.physical_plan.contains("CompiledPipelineExec"),
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
         "{}",
         trace.physical_plan
     );
@@ -707,21 +793,24 @@ async fn q1_shaped_composite_group_aggregate_uses_partial_state_pipeline() {
         trace
             .pipeline_candidates
             .iter()
-            .any(|candidate| candidate.node == "CompiledPipelineExec"
-                && candidate.kind == PipelineKind::Aggregate
-                && candidate.compiled
-                && candidate.source == "arrow_batch"
-                && candidate.stages == vec!["filter"]
-                && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("mlir")
-                && candidate.reason == "compiled"),
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.source == "arrow_batch"
+                    && candidate.stages == vec!["filter"]
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
         "{:?}",
         trace.pipeline_candidates
     );
 }
 
 #[tokio::test]
-async fn q1_decimal_group_aggregate_shape_uses_partial_state_pipeline() {
+async fn q1_decimal_group_aggregate_shape_uses_global_final_pipeline() {
     let db = Database::new_temp().expect("database");
     let money_type = DataType::Decimal128(12, 2);
     let rate_type = DataType::Decimal128(4, 2);
@@ -795,7 +884,9 @@ async fn q1_decimal_group_aggregate_shape_uses_partial_state_pipeline() {
 
     let trace = db.debug_last_trace().expect("trace");
     assert!(
-        trace.physical_plan.contains("CompiledPipelineExec"),
+        trace
+            .physical_plan
+            .contains("CompiledGlobalGroupAggregateExec"),
         "{}",
         trace.physical_plan
     );
@@ -803,14 +894,17 @@ async fn q1_decimal_group_aggregate_shape_uses_partial_state_pipeline() {
         trace
             .pipeline_candidates
             .iter()
-            .any(|candidate| candidate.node == "CompiledPipelineExec"
-                && candidate.kind == PipelineKind::Aggregate
-                && candidate.compiled
-                && candidate.source == "arrow_batch"
-                && candidate.stages == vec!["filter"]
-                && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("mlir")
-                && candidate.reason == "compiled"),
+            .any(
+                |candidate| candidate.node == "CompiledGlobalGroupAggregateExec"
+                    && candidate.kind == PipelineKind::Aggregate
+                    && candidate.compiled
+                    && candidate.source == "arrow_batch"
+                    && candidate.stages == vec!["filter"]
+                    && candidate.sink == "group_aggregate"
+                    && candidate.output_mode == Some("final_values")
+                    && candidate.backend.as_deref() == Some("mlir")
+                    && candidate.reason == "compiled"
+            ),
         "{:?}",
         trace.pipeline_candidates
     );

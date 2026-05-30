@@ -7,10 +7,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use quill_jit::{
     CompiledKernel, JitOptions, KernelKind, MlirBackend, PipelineLowering, PipelineSpec,
 };
+use quill_plan::GroupAggregateOutputMode;
 use quill_runtime::{FilterProjectKernel, FilterSumKernel, GroupAggregateKernel};
 
-use crate::extract::{OutputAdapter, PhysicalPipeline};
-use crate::{CompiledPipelineExec, PipelineRuntime};
+use crate::extract::{OutputAdapter, PhysicalPipeline, PipelineExecution};
+use crate::{CompiledGlobalGroupAggregateExec, CompiledPipelineExec, PipelineRuntime};
 
 #[derive(Debug)]
 pub(crate) struct PipelineCompiler<'a> {
@@ -29,6 +30,7 @@ impl<'a> PipelineCompiler<'a> {
             output_schema,
             graph,
             output_adapter,
+            execution,
         } = pipeline;
 
         match PipelineLowering::from_graph(&graph) {
@@ -81,16 +83,30 @@ impl<'a> PipelineCompiler<'a> {
                     .into_iter()
                     .collect::<Vec<_>>();
                 let spec = PipelineSpec::group_aggregate(predicate.as_ref(), &keys, &aggregates);
-                let runtime = match GroupAggregateKernel::try_new(
+                let output_mode = match execution {
+                    PipelineExecution::PartitionLocal => GroupAggregateOutputMode::PartialState,
+                    PipelineExecution::Global => GroupAggregateOutputMode::FinalValues,
+                };
+                let runtime = match GroupAggregateKernel::try_new_with_output(
                     &stages,
                     keys,
                     aggregates,
                     Arc::clone(&output_schema),
+                    output_mode,
                 ) {
                     Ok(runtime) => runtime,
                     Err(_) => return Ok(None),
                 };
                 let kernel = self.group_aggregate_kernel(spec);
+                if execution == PipelineExecution::Global {
+                    let exec = CompiledGlobalGroupAggregateExec::try_new(
+                        input,
+                        runtime,
+                        output_schema,
+                        kernel,
+                    )?;
+                    return Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>));
+                }
                 let exec = CompiledPipelineExec::try_new(
                     input,
                     PipelineRuntime::GroupAggregate(runtime),

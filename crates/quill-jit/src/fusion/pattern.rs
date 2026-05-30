@@ -86,12 +86,17 @@ impl FusionConstraint {
                 _ => false,
             },
             Self::FixedWidthGroupAggregate => match (&graph.stages[..], &graph.sink) {
-                ([], PipelineSink::GroupAggregate { keys, aggregates }) => {
-                    PipelineSpec::group_aggregate(None, keys, aggregates).is_some()
-                }
+                (
+                    [],
+                    PipelineSink::GroupAggregate {
+                        keys, aggregates, ..
+                    },
+                ) => PipelineSpec::group_aggregate(None, keys, aggregates).is_some(),
                 (
                     [PipelineStage::Filter(predicate)],
-                    PipelineSink::GroupAggregate { keys, aggregates },
+                    PipelineSink::GroupAggregate {
+                        keys, aggregates, ..
+                    },
                 ) => PipelineSpec::group_aggregate(Some(predicate), keys, aggregates).is_some(),
                 _ => false,
             },

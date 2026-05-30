@@ -4,7 +4,7 @@ mod expr;
 mod extract;
 mod rule;
 
-pub use exec::{CompiledPipelineExec, PipelineRuntime};
+pub use exec::{CompiledGlobalGroupAggregateExec, CompiledPipelineExec, PipelineRuntime};
 pub use extract::PipelineCandidate;
 pub(crate) use extract::{extract_pipeline_from_node, pipeline_from_node};
 pub use rule::{DataFusionAdapter, JitCandidate, MlirJitRule};

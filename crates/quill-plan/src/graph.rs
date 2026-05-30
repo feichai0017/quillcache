@@ -175,6 +175,7 @@ pub enum PipelineSink {
     GroupAggregate {
         keys: Vec<JitExpr>,
         aggregates: Vec<GroupAggregate>,
+        output: GroupAggregateOutputMode,
     },
 }
 
@@ -201,6 +202,21 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAggregateOutputMode {
+    PartialState,
+    FinalValues,
+}
+
+impl GroupAggregateOutputMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PartialState => "partial_state",
+            Self::FinalValues => "final_values",
+        }
+    }
 }
 
 impl AggregateFunc {
@@ -255,6 +271,27 @@ impl GroupAggregate {
             alias: alias.into(),
         }
     }
+
+    pub fn new_with_output_and_states(
+        func: AggregateFunc,
+        expr: JitExpr,
+        output_type: JitType,
+        state_types: Vec<JitType>,
+        alias: impl Into<String>,
+    ) -> Self {
+        Self {
+            func,
+            expr,
+            output_type,
+            state_types,
+            alias: alias.into(),
+        }
+    }
+
+    pub fn with_output_type(mut self, output_type: JitType) -> Self {
+        self.output_type = output_type;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,10 +323,41 @@ impl PipelineGraph {
         keys: Vec<JitExpr>,
         aggregates: Vec<GroupAggregate>,
     ) -> Self {
+        Self::group_aggregate_with_output(
+            stages,
+            keys,
+            aggregates,
+            GroupAggregateOutputMode::PartialState,
+        )
+    }
+
+    pub fn group_aggregate_final(
+        stages: Vec<PipelineStage>,
+        keys: Vec<JitExpr>,
+        aggregates: Vec<GroupAggregate>,
+    ) -> Self {
+        Self::group_aggregate_with_output(
+            stages,
+            keys,
+            aggregates,
+            GroupAggregateOutputMode::FinalValues,
+        )
+    }
+
+    pub fn group_aggregate_with_output(
+        stages: Vec<PipelineStage>,
+        keys: Vec<JitExpr>,
+        aggregates: Vec<GroupAggregate>,
+        output: GroupAggregateOutputMode,
+    ) -> Self {
         Self {
             source: PipelineSource::ArrowBatch,
             stages,
-            sink: PipelineSink::GroupAggregate { keys, aggregates },
+            sink: PipelineSink::GroupAggregate {
+                keys,
+                aggregates,
+                output,
+            },
         }
     }
 

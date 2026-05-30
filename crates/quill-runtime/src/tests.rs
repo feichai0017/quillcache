@@ -8,8 +8,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use quill_plan::{
-    AggregateFunc, GroupAggregate, JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType,
-    PipelineStage,
+    AggregateFunc, GroupAggregate, GroupAggregateOutputMode, JitBinaryOp, JitExpr, JitProjection,
+    JitScalar, JitType, PipelineStage,
 };
 
 use super::{
@@ -514,6 +514,184 @@ fn executes_group_avg_as_partial_state() {
 }
 
 #[test]
+fn finishes_group_aggregate_as_final_values() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("avg_v", DataType::Float64, true),
+        Field::new("sum_v", DataType::Int64, true),
+        Field::new("count_v", DataType::Int64, false),
+        Field::new("min_v", DataType::Int64, true),
+        Field::new("max_v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "B", "B"])),
+            Arc::new(Int64Array::from(vec![Some(10), Some(20), Some(30), None])),
+        ],
+    )
+    .unwrap();
+    let key = JitExpr::Column {
+        index: 0,
+        name: "flag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: true,
+    };
+    let aggregates = vec![
+        GroupAggregate::new_with_output_and_states(
+            AggregateFunc::Avg,
+            value.clone(),
+            JitType::Float64,
+            vec![JitType::UInt64, JitType::Int64],
+            "avg_v",
+        ),
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            value.clone(),
+            JitType::Int64,
+            "count_v",
+        ),
+        GroupAggregate::new(AggregateFunc::Min, value.clone(), JitType::Int64, "min_v"),
+        GroupAggregate::new(AggregateFunc::Max, value, JitType::Int64, "max_v"),
+    ];
+    let kernel = GroupAggregateKernel::try_new_with_output(
+        &[],
+        vec![key],
+        aggregates,
+        output_schema,
+        GroupAggregateOutputMode::FinalValues,
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    kernel.accumulate(&mut state, &batch).unwrap();
+    let output = kernel.finish_final(state).unwrap();
+
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let averages = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let sums = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = output
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mins = output
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let maxes = output
+        .column(5)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(keys.value(0), "A");
+    assert_eq!(keys.value(1), "B");
+    assert_eq!(averages.values().as_ref(), &[15.0, 30.0]);
+    assert_eq!(sums.values().as_ref(), &[30, 30]);
+    assert_eq!(counts.values().as_ref(), &[2, 1]);
+    assert_eq!(mins.values().as_ref(), &[10, 30]);
+    assert_eq!(maxes.values().as_ref(), &[20, 30]);
+}
+
+#[test]
+fn finishes_decimal_avg_as_final_value() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("price", DataType::Decimal128(12, 2), false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("avg_price", DataType::Decimal128(16, 6), true),
+    ]));
+    let price = Decimal128Array::from(vec![1000_i128, 2000, 3000])
+        .with_precision_and_scale(12, 2)
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "B"])),
+            Arc::new(price),
+        ],
+    )
+    .unwrap();
+    let key = JitExpr::Column {
+        index: 0,
+        name: "flag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "price".to_string(),
+        ty: JitType::Decimal128 {
+            precision: 12,
+            scale: 2,
+        },
+        nullable: false,
+    };
+    let aggregate = GroupAggregate::new_with_output_and_states(
+        AggregateFunc::Avg,
+        value,
+        JitType::Decimal128 {
+            precision: 16,
+            scale: 6,
+        },
+        vec![
+            JitType::UInt64,
+            JitType::Decimal128 {
+                precision: 22,
+                scale: 2,
+            },
+        ],
+        "avg_price",
+    );
+    let kernel = GroupAggregateKernel::try_new_with_output(
+        &[],
+        vec![key],
+        vec![aggregate],
+        output_schema,
+        GroupAggregateOutputMode::FinalValues,
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    kernel.accumulate(&mut state, &batch).unwrap();
+    let output = kernel.finish_final(state).unwrap();
+
+    let averages = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(averages.values().as_ref(), &[15_000_000, 30_000_000]);
+    assert_eq!(averages.precision(), 16);
+    assert_eq!(averages.scale(), 6);
+}
+
+#[test]
 fn binds_group_ids_for_selected_rows() {
     let input_schema = Arc::new(Schema::new(vec![
         Field::new("flag", DataType::Utf8, false),
@@ -563,6 +741,83 @@ fn binds_group_ids_for_selected_rows() {
 
     assert_eq!(binding.group_ids(), &[0, 1, 0, -1]);
     assert_eq!(binding.selected_rows(), 3);
+}
+
+#[test]
+fn final_values_skip_key_only_groups_not_touched_by_dense_update() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("sum_v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B", "A", "C"])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+        ],
+    )
+    .unwrap();
+    let key = JitExpr::Column {
+        index: 0,
+        name: "flag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let predicate = JitExpr::Binary {
+        op: JitBinaryOp::Lt,
+        left: Box::new(value.clone()),
+        right: Box::new(JitExpr::Literal(JitScalar::Int64(20))),
+        ty: JitType::Bool,
+        nullable: false,
+    };
+    let aggregate = GroupAggregate::new(AggregateFunc::Sum, value, JitType::Int64, "sum_v");
+    let kernel = GroupAggregateKernel::try_new_with_output(
+        &[PipelineStage::Filter(predicate)],
+        vec![key],
+        vec![aggregate],
+        output_schema,
+        GroupAggregateOutputMode::FinalValues,
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    kernel.ensure_dense_state(&mut state).unwrap();
+    let binding = kernel.bind_batch_keys(&mut state, &batch).unwrap();
+    assert_eq!(binding.group_ids(), &[0, 1, 0, 2]);
+
+    {
+        let dense = kernel.dense_state_mut(&mut state).unwrap();
+        dense.touched_mut()[0] = 1;
+        let [GroupAggregateStateField::Int64 { values, valid }] = dense.fields_mut() else {
+            panic!("expected one dense sum state field");
+        };
+        values[0] = 10;
+        valid[0] = 1;
+    }
+
+    let output = kernel.finish_final(state).unwrap();
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys.value(0), "A");
+    assert_eq!(sums.values().as_ref(), &[10]);
 }
 
 #[test]
@@ -723,6 +978,121 @@ fn finishes_group_aggregate_directly_from_dense_state() {
     assert_eq!(keys.values().as_ref(), &[1, 2]);
     assert_eq!(sums.values().as_ref(), &[30, 20]);
     assert_eq!(counts.values().as_ref(), &[2, 1]);
+}
+
+#[test]
+fn finishes_group_final_values_directly_from_dense_state() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("sum_v", DataType::Int64, true),
+        Field::new("count_v", DataType::Int64, false),
+        Field::new("avg_v", DataType::Float64, true),
+    ]));
+    let key = JitExpr::Column {
+        index: 0,
+        name: "k".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let aggregates = vec![
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            JitExpr::Literal(JitScalar::Int64(1)),
+            JitType::Int64,
+            "count_v",
+        ),
+        GroupAggregate::new_with_output_and_states(
+            AggregateFunc::Avg,
+            value,
+            JitType::Float64,
+            vec![JitType::UInt64, JitType::Int64],
+            "avg_v",
+        ),
+    ];
+    let kernel = GroupAggregateKernel::try_new_with_output(
+        &[],
+        vec![key],
+        aggregates,
+        output_schema,
+        GroupAggregateOutputMode::FinalValues,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    let binding = kernel.bind_batch(&mut state, &batch).unwrap();
+    assert_eq!(binding.group_ids(), &[0, 1]);
+
+    {
+        let dense = kernel.dense_state_mut(&mut state).unwrap();
+        let [GroupAggregateStateField::Int64 {
+            values: sums,
+            valid: sum_valid,
+        }, GroupAggregateStateField::Int64 {
+            values: counts,
+            valid: count_valid,
+        }, GroupAggregateStateField::UInt64 {
+            values: avg_counts,
+            valid: avg_count_valid,
+        }, GroupAggregateStateField::Int64 {
+            values: avg_sums,
+            valid: avg_sum_valid,
+        }] = dense.fields_mut()
+        else {
+            panic!("expected sum, count, avg count, and avg sum dense state fields");
+        };
+        sums.copy_from_slice(&[30, 20]);
+        sum_valid.copy_from_slice(&[1, 1]);
+        counts.copy_from_slice(&[2, 1]);
+        count_valid.copy_from_slice(&[1, 1]);
+        avg_counts.copy_from_slice(&[2, 1]);
+        avg_count_valid.copy_from_slice(&[1, 1]);
+        avg_sums.copy_from_slice(&[30, 20]);
+        avg_sum_valid.copy_from_slice(&[1, 1]);
+    }
+
+    let output = kernel.finish_final(state).unwrap();
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let averages = output
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(keys.values().as_ref(), &[1, 2]);
+    assert_eq!(sums.values().as_ref(), &[30, 20]);
+    assert_eq!(counts.values().as_ref(), &[2, 1]);
+    assert_eq!(averages.values().as_ref(), &[15.0, 20.0]);
 }
 
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {

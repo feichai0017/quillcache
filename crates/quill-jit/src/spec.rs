@@ -100,6 +100,9 @@ impl PipelineSpec {
         }
 
         let mut columns = BTreeMap::new();
+        if let Some(predicate) = predicate {
+            collect_fixed_width_columns(predicate, &mut columns)?;
+        }
         for aggregate in aggregates {
             ensure_group_update_aggregate(aggregate)?;
             collect_fixed_width_columns(&aggregate.expr, &mut columns)?;

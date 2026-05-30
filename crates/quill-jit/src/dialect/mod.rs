@@ -63,7 +63,9 @@ impl QuillDialectModule {
             PipelineSink::Sum { measure } => QuillDialectSink::PlainSum {
                 measure: measure.clone(),
             },
-            PipelineSink::GroupAggregate { keys, aggregates } => QuillDialectSink::GroupAggregate {
+            PipelineSink::GroupAggregate {
+                keys, aggregates, ..
+            } => QuillDialectSink::GroupAggregate {
                 keys: keys.clone(),
                 aggregates: aggregates.clone(),
             },

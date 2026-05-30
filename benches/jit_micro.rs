@@ -8,8 +8,8 @@ use quill_core::database::{Database, DatabaseOptions};
 use quill_jit::{FixedColumnInput, RecordPipelineOutput};
 use quill_jit::{JitOptions, MlirBackend, PipelineLowering};
 use quill_plan::{
-    AggregateFunc, GroupAggregate, JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType,
-    PipelineGraph, PipelineStage,
+    AggregateFunc, GroupAggregate, GroupAggregateOutputMode, JitBinaryOp, JitExpr, JitProjection,
+    JitScalar, JitType, PipelineGraph, PipelineStage,
 };
 use quill_runtime::{GroupAggregateKernel, GroupAggregateState, GroupAggregateStateField};
 
@@ -266,6 +266,7 @@ fn bench_pipeline_graph_and_mlir(c: &mut Criterion) {
             black_box(
                 backend
                     .compile_group_aggregate_update(
+                        None,
                         black_box(std::slice::from_ref(&key)),
                         black_box(&aggregates),
                     )
@@ -496,7 +497,7 @@ fn bench_compiled_group_aggregate_dense_update_kernel(c: &mut Criterion) {
     let key = group_key();
     let aggregates = group_aggregates();
     let kernel = MlirBackend::new()
-        .compile_group_aggregate_update(&[key], &aggregates)
+        .compile_group_aggregate_update(None, &[key], &aggregates)
         .expect("compiled group aggregate update");
     let mut state_fields = vec![
         int64_state(group_count),
@@ -504,10 +505,12 @@ fn bench_compiled_group_aggregate_dense_update_kernel(c: &mut Criterion) {
         uint64_state(group_count),
         int64_state(group_count),
     ];
+    let mut touched = vec![0_u8; group_count];
 
     c.bench_function("kernel/group_aggregate_dense_update_64k", |b| {
         b.iter(|| {
             reset_states(&mut state_fields);
+            touched.fill(0);
             kernel
                 .invoke(
                     black_box(group_ids.as_slice()),
@@ -515,6 +518,7 @@ fn bench_compiled_group_aggregate_dense_update_kernel(c: &mut Criterion) {
                         index: 1,
                         values: values.as_slice(),
                     }]),
+                    black_box(touched.as_mut_slice()),
                     black_box(&mut state_fields),
                 )
                 .expect("execute compiled group aggregate update");
@@ -528,6 +532,13 @@ fn bench_group_aggregate_runtime_boundaries(c: &mut Criterion) {
     let group_count = 1_024_usize;
     let batch = group_batch(row_count, group_count);
     let kernel = group_kernel();
+    let values = (0..row_count)
+        .map(|value| value % 1_000)
+        .collect::<Vec<_>>();
+    let final_kernel = group_final_kernel();
+    let update_kernel = MlirBackend::new()
+        .compile_group_aggregate_update(None, &[group_key()], &group_final_aggregates())
+        .expect("compile final group aggregate update");
     let utf8_batch = utf8_group_batch(row_count);
     let utf8_kernel = utf8_group_kernel();
     let utf8_filtered_batch = utf8_filtered_group_batch(row_count);
@@ -566,6 +577,38 @@ fn bench_group_aggregate_runtime_boundaries(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    c.bench_function(
+        "pipeline/group_aggregate_bind_update_finish_final_64k",
+        |b| {
+            b.iter(|| {
+                let mut state = final_kernel.new_state();
+                let binding = final_kernel
+                    .bind_batch(&mut state, black_box(&batch))
+                    .expect("bind group aggregate batch");
+                let dense = final_kernel
+                    .dense_state_mut(&mut state)
+                    .expect("dense group aggregate state");
+                let (touched, fields) = dense.update_parts_mut();
+                update_kernel
+                    .invoke(
+                        black_box(binding.group_ids()),
+                        black_box(&[FixedColumnInput::Int64 {
+                            index: 1,
+                            values: values.as_slice(),
+                        }]),
+                        black_box(touched),
+                        black_box(fields),
+                    )
+                    .expect("execute group aggregate update");
+                black_box(
+                    final_kernel
+                        .finish_final(state)
+                        .expect("finish final group aggregate"),
+                );
+            });
+        },
+    );
 
     c.bench_function("runtime/group_aggregate_bind_utf8_pair_build_64k", |b| {
         b.iter(|| {
@@ -643,6 +686,22 @@ fn group_kernel() -> GroupAggregateKernel {
         ])),
     )
     .expect("group aggregate kernel")
+}
+
+fn group_final_kernel() -> GroupAggregateKernel {
+    GroupAggregateKernel::try_new_with_output(
+        &[],
+        vec![group_key()],
+        group_final_aggregates(),
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("sum_v", DataType::Int64, true),
+            Field::new("count_star", DataType::Int64, true),
+            Field::new("avg_v", DataType::Float64, true),
+        ])),
+        GroupAggregateOutputMode::FinalValues,
+    )
+    .expect("final group aggregate kernel")
 }
 
 fn utf8_group_batch(row_count: i64) -> RecordBatch {
@@ -859,6 +918,31 @@ fn group_aggregates() -> Vec<GroupAggregate> {
         GroupAggregate::new_with_states(
             AggregateFunc::Avg,
             value,
+            vec![JitType::UInt64, JitType::Int64],
+            "avg_v",
+        ),
+    ]
+}
+
+fn group_final_aggregates() -> Vec<GroupAggregate> {
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    vec![
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            JitExpr::Literal(JitScalar::Int64(1)),
+            JitType::Int64,
+            "count_star",
+        ),
+        GroupAggregate::new_with_output_and_states(
+            AggregateFunc::Avg,
+            value,
+            JitType::Float64,
             vec![JitType::UInt64, JitType::Int64],
             "avg_v",
         ),

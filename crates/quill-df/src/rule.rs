@@ -11,7 +11,8 @@ use quill_jit::{FrontendAdapter, JitOptions, KernelKind, MlirBackend};
 
 use crate::compiler::PipelineCompiler;
 use crate::{
-    extract_pipeline_from_node, pipeline_from_node, CompiledPipelineExec, PipelineCandidate,
+    extract_pipeline_from_node, pipeline_from_node, CompiledGlobalGroupAggregateExec,
+    CompiledPipelineExec, PipelineCandidate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,6 +86,17 @@ impl MlirJitRule {
         if let Some(compiled) = plan.as_any().downcast_ref::<CompiledPipelineExec>() {
             return Some(JitCandidate {
                 node: "CompiledPipelineExec",
+                kernel: compiled.kernel().kind,
+                backend: compiled.kernel().backend.clone(),
+                executable: compiled.kernel().executable,
+            });
+        }
+        if let Some(compiled) = plan
+            .as_any()
+            .downcast_ref::<CompiledGlobalGroupAggregateExec>()
+        {
+            return Some(JitCandidate {
+                node: "CompiledGlobalGroupAggregateExec",
                 kernel: compiled.kernel().kind,
                 backend: compiled.kernel().backend.clone(),
                 executable: compiled.kernel().executable,

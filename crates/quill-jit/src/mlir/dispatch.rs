@@ -13,7 +13,7 @@ use crate::{
     FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumnInput, JitType, MlirBackend,
     MlirColumn, PipelineSpec, RecordPipelineOutput,
 };
-use quill_runtime::{GroupAggregateBatchBinding, GroupAggregateKernel, GroupAggregateState};
+use quill_runtime::{GroupAggregateKernel, GroupAggregateState};
 
 thread_local! {
     static RECORD_PIPELINE_CACHE: RefCell<HashMap<String, CompiledRecordPipeline>> =
@@ -102,7 +102,6 @@ pub fn execute_filter_sum(
 pub fn execute_group_aggregate_update(
     kernel: &CompiledKernel,
     runtime: &GroupAggregateKernel,
-    binding: &GroupAggregateBatchBinding,
     state: &mut GroupAggregateState,
     batch: &RecordBatch,
 ) -> Result<Option<()>> {
@@ -116,6 +115,33 @@ pub fn execute_group_aggregate_update(
     let Some(inputs) = fixed_inputs(batch, columns)? else {
         return Ok(None);
     };
+
+    let cache_key = group_aggregate_cache_key(runtime);
+    let compiled = GROUP_AGGREGATE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&cache_key) {
+            let compiled = match MlirBackend::new().compile_group_aggregate_update(
+                runtime.predicate(),
+                runtime.keys(),
+                runtime.aggregates(),
+            ) {
+                Ok(compiled) => compiled,
+                Err(_) => return Ok(false),
+            };
+            cache.insert(cache_key.clone(), compiled);
+        }
+        Ok(true)
+    })?;
+    if !compiled {
+        return Ok(None);
+    }
+
+    runtime.ensure_dense_state(state)?;
+    let binding = if runtime.predicate().is_some() {
+        runtime.bind_batch_keys(state, batch)?
+    } else {
+        runtime.bind_batch(state, batch)?
+    };
     let dense = match runtime.dense_state_mut(state) {
         Ok(dense) => dense,
         Err(_) => return Ok(None),
@@ -124,22 +150,13 @@ pub fn execute_group_aggregate_update(
         return Ok(Some(()));
     }
 
-    let cache_key = group_aggregate_cache_key(runtime);
+    let (touched, fields) = dense.update_parts_mut();
     let invoked = GROUP_AGGREGATE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if !cache.contains_key(&cache_key) {
-            let compiled = match MlirBackend::new()
-                .compile_group_aggregate_update(runtime.keys(), runtime.aggregates())
-            {
-                Ok(compiled) => compiled,
-                Err(_) => return Ok(false),
-            };
-            cache.insert(cache_key.clone(), compiled);
-        }
+        let cache = cache.borrow();
         cache
             .get(&cache_key)
             .expect("compiled kernel was inserted")
-            .invoke(binding.group_ids(), &inputs, dense.fields_mut())
+            .invoke(binding.group_ids(), &inputs, touched, fields)
             .map(|()| true)
     })?;
     if !invoked {
@@ -191,7 +208,12 @@ fn filter_sum_cache_key(runtime: &FilterSumKernel) -> String {
 }
 
 fn group_aggregate_cache_key(runtime: &GroupAggregateKernel) -> String {
-    format!("{:?}|{:?}", runtime.keys(), runtime.aggregates())
+    format!(
+        "{:?}|{:?}|{:?}",
+        runtime.predicate(),
+        runtime.keys(),
+        runtime.aggregates()
+    )
 }
 
 fn fixed_inputs<'a>(
