@@ -132,7 +132,7 @@ async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse 
     Json(json!({
         "engines": control.engines(),
         "workers": control.workers(),
-        "index": control.residency().stats(),
+        "index": control.residency().metrics(),
         "resident_blocks": control.residency().len(),
         "residency": control.residency().snapshot(),
     }))

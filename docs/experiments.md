@@ -51,7 +51,7 @@ estimated TPOT beyond the configured SLO.
 ## First Index Experiment
 
 Compare Holt ART and RocksDB/LSM as residency-index backends using the same
-`ResidencyIndexStore` contract:
+`IndexBackend` contract:
 
 - ingest-only lifecycle event stream
 - mixed store/remove stream under HBM pressure

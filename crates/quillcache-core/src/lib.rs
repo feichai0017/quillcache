@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -470,7 +471,10 @@ pub struct IndexMetrics {
 /// Event translation (vLLM/SGLang KV events -> `KvBlockKey`) lives in the
 /// control plane and is backend-agnostic, so every backend sees the same
 /// `put` / `remove_block` / `clear_worker` calls.
-pub trait IndexBackend {
+///
+/// `Send + Sync + Debug` so a backend can be held as `Box<dyn IndexBackend>`
+/// inside an async control plane behind a lock and swapped at runtime.
+pub trait IndexBackend: std::fmt::Debug + Send + Sync {
     /// Stable backend name for reports (for example "memory", "holt", "rocksdb").
     fn name(&self) -> &str;
 
@@ -517,6 +521,110 @@ pub trait IndexBackend {
             resident_blocks: snapshot.len() as u64,
             resident_bytes: snapshot.iter().map(|entry| entry.bytes).sum(),
             ..IndexMetrics::default()
+        }
+    }
+
+    /// Whether this backend persists residency across process restarts. The
+    /// in-memory reference backend returns `false`; Holt (ART), RocksDB (LSM),
+    /// and filesystem backends return `true`. Drives recovery experiments and is
+    /// surfaced in reports.
+    fn persistent(&self) -> bool {
+        false
+    }
+}
+
+/// Canonical in-memory [`IndexBackend`]: a flat map from block identity to
+/// residency. This is the reference backend and the baseline that persistent
+/// backends (Holt/ART, RocksDB/LSM, filesystem) are compared against in
+/// Experiment mode. It reports `bytes_written = 0` because nothing is persisted.
+#[derive(Debug, Default)]
+pub struct MemoryIndex {
+    entries: HashMap<KvBlockKey, Vec<CacheResidency>>,
+    puts: u64,
+    removes: u64,
+}
+
+impl MemoryIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl IndexBackend for MemoryIndex {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    fn put(&mut self, residency: CacheResidency) {
+        let entries = self.entries.entry(residency.key.clone()).or_default();
+        entries.retain(|entry| {
+            !(entry.worker_id == residency.worker_id && entry.tier == residency.tier)
+        });
+        entries.push(residency);
+        self.puts += 1;
+    }
+
+    fn locate(&self, key: &KvBlockKey) -> Vec<CacheResidency> {
+        self.entries.get(key).cloned().unwrap_or_default()
+    }
+
+    fn prefix_scan(&self, scope: &IdentityScope, prefix_hash: &str) -> Vec<CacheResidency> {
+        self.entries
+            .iter()
+            .filter(|(key, _)| scope.matches(key) && key.prefix_hash == prefix_hash)
+            .flat_map(|(_, entries)| entries.iter().cloned())
+            .collect()
+    }
+
+    fn remove_block(&mut self, scope: &IdentityScope, worker_id: &str, block_hash: &str) -> usize {
+        let mut removed = 0;
+        self.entries.retain(|key, entries| {
+            if scope.matches(key) && key.block_hash == block_hash {
+                let before = entries.len();
+                entries.retain(|entry| entry.worker_id != worker_id);
+                removed += before - entries.len();
+            }
+            !entries.is_empty()
+        });
+        self.removes += removed as u64;
+        removed
+    }
+
+    fn clear_worker(&mut self, worker_id: &str) {
+        self.entries.retain(|_, entries| {
+            entries.retain(|entry| entry.worker_id != worker_id);
+            !entries.is_empty()
+        });
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn snapshot(&self) -> Vec<CacheResidency> {
+        self.entries
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+
+    fn metrics(&self) -> IndexMetrics {
+        IndexMetrics {
+            resident_blocks: self.len() as u64,
+            resident_bytes: self
+                .entries
+                .values()
+                .flatten()
+                .map(|entry| entry.bytes)
+                .sum(),
+            puts: self.puts,
+            removes: self.removes,
+            prefix_scans: 0,
+            bytes_written: 0,
         }
     }
 }

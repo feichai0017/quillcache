@@ -6,16 +6,22 @@ tensor bytes.
 
 ## Interface
 
-The Rust boundary is `ResidencyIndexStore` in `quillcache-control`:
+The Rust boundary is the single trait `IndexBackend` in `quillcache-core`:
 
-- ingest a batch of KV lifecycle events
-- return a snapshot of resident blocks for routing
-- expose basic backend stats
-- clear index state
+- `put` / `remove_block` / `clear_worker` — identity-scoped residency updates
+- `locate` — all residencies for an exact block identity
+- `prefix_scan` — identity-aware prefix lookup (the ART/radix strength)
+- `snapshot` — resident blocks for routing
+- `metrics` — comparable `IndexMetrics` (incl. `bytes_written`)
+- `persistent` — whether residency survives restart
 
-The first implementation is `MemoryResidencyIndex`. It is deliberately small:
-it proves the gateway, event ingest, routing, and state API before adding a
-persistent storage engine.
+KV-event translation is **not** part of the trait: `quillcache-control` resolves
+block identity once in the backend-agnostic `ingest_batch(&mut dyn IndexBackend, …)`,
+so backends never re-implement vLLM/SGLang event parsing.
+
+The first implementation is `MemoryIndex` (in `quillcache-core`). It is
+deliberately small: it proves the gateway, event ingest, routing, and state API,
+and is the baseline against which persistent backends are compared.
 
 ## Stored Object
 
@@ -82,5 +88,6 @@ schemas, multi-turn sessions, and block removals from HBM pressure.
 ## v0.1 Boundary
 
 v0.1 ships only the memory backend. The important architectural decision is that
-the gateway and router depend on the `ResidencyIndexStore` trait, so Holt and
-RocksDB can be introduced without changing request proxying or route scoring.
+the gateway, control plane, and router depend on the `IndexBackend` trait, so
+Holt and RocksDB can be introduced without changing request proxying or route
+scoring.

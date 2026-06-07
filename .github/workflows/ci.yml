@@ -5,46 +5,31 @@ on:
     branches: ["main"]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  rust:
+  check:
+    name: build · fmt · clippy · test
     runs-on: ubuntu-latest
-    env:
-      MLIR_SYS_220_PREFIX: /usr/lib/llvm-22
-      LLVM_SYS_220_PREFIX: /usr/lib/llvm-22
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM/MLIR 22
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg lsb-release software-properties-common cmake ninja-build
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22 all
-          sudo apt-get install -y llvm-22-dev libmlir-22-dev mlir-22-tools clang-22
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: fmt
+      - name: rustfmt
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --workspace
 
       - name: test
-        run: cargo test -q
-
-  docker-build:
-    runs-on: ubuntu-latest
-    needs: rust
-    steps:
-      - uses: actions/checkout@v4
-
-      # 仅构建镜像，不在 Dockerfile 里跑测试
-      - name: Build Docker image (no push)
-        run: docker build --pull -t quillsql-ci .
+        run: cargo test --workspace

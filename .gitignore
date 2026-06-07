@@ -15,7 +15,6 @@ target/
 
 /target
 .vscode
-.github
 .history
 AGENTS.md
 GEMINI.md

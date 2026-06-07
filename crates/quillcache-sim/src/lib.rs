@@ -1,5 +1,8 @@
-use quillcache_core::{CacheResidency, KvBlockKey, RequestShape, SloTarget, WorkerState};
-use quillcache_router::{GreedyStatePlaneRouter, RouterError};
+use quillcache_core::{
+    CacheResidency, IndexBackend, IndexMetrics, KvBlockKey, MemoryIndex, RequestShape, SloTarget,
+    WorkerState,
+};
+use quillcache_router::{GreedyStatePlaneRouter, RouterError, RoutingPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -44,21 +47,46 @@ pub struct DecisionSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationReport {
+    pub policy: String,
+    pub index_backend: String,
     pub total_requests: u32,
     pub workers: u32,
     pub cache_reusable_blocks: u64,
     pub recompute_blocks: u64,
     pub transfer_blocks: u64,
     pub avg_estimated_ttft_ms: f64,
+    pub index_metrics: IndexMetrics,
     pub decisions: Vec<DecisionSummary>,
 }
 
+/// Run the default Experiment-mode workload: cache-aware greedy routing over the
+/// in-memory reference backend.
 pub fn run_synthetic(config: SyntheticWorkloadConfig) -> Result<SimulationReport, SimError> {
+    run_synthetic_with(
+        &GreedyStatePlaneRouter::default(),
+        &mut MemoryIndex::new(),
+        config,
+    )
+}
+
+/// Experiment-mode core: replay a synthetic workload through any [`RoutingPolicy`]
+/// and any [`IndexBackend`], so policies (load-only vs cache-aware vs future
+/// SLO-/session-aware) and index backends (memory vs Holt/ART vs RocksDB/LSM vs
+/// filesystem) can be compared on the *same* trace. The returned report carries
+/// the policy name, the backend name, and the backend metrics — including
+/// `bytes_written` for write-amplification studies on persistent backends.
+pub fn run_synthetic_with<P, B>(
+    policy: &P,
+    index: &mut B,
+    config: SyntheticWorkloadConfig,
+) -> Result<SimulationReport, SimError>
+where
+    P: RoutingPolicy,
+    B: IndexBackend,
+{
     let workers: Vec<_> = (0..config.workers)
         .map(|idx| WorkerState::new(format!("worker-{idx}"), format!("rack-{}", idx % 2)))
         .collect();
-    let router = GreedyStatePlaneRouter::default();
-    let mut residency = Vec::new();
     let mut decisions = Vec::new();
     let mut cache_reusable_blocks = 0;
     let mut recompute_blocks = 0;
@@ -67,7 +95,8 @@ pub fn run_synthetic(config: SyntheticWorkloadConfig) -> Result<SimulationReport
 
     for request_idx in 0..config.requests {
         let request = synthetic_request(request_idx, config);
-        let decision = router.route(&request, &workers, &residency)?;
+        let residency = index.snapshot();
+        let decision = policy.route(&request, &workers, &residency)?;
 
         cache_reusable_blocks += decision.reusable_blocks() as u64;
         recompute_blocks += decision.recomputes.len() as u64;
@@ -85,7 +114,7 @@ pub fn run_synthetic(config: SyntheticWorkloadConfig) -> Result<SimulationReport
         });
 
         for block in request.blocks {
-            residency.push(CacheResidency::hbm(
+            index.put(CacheResidency::hbm(
                 decision.worker_id.clone(),
                 block,
                 config.block_bytes,
@@ -94,6 +123,8 @@ pub fn run_synthetic(config: SyntheticWorkloadConfig) -> Result<SimulationReport
     }
 
     Ok(SimulationReport {
+        policy: policy.name().to_string(),
+        index_backend: index.name().to_string(),
         total_requests: config.requests,
         workers: config.workers,
         cache_reusable_blocks,
@@ -104,6 +135,7 @@ pub fn run_synthetic(config: SyntheticWorkloadConfig) -> Result<SimulationReport
         } else {
             total_ttft_ms / f64::from(config.requests)
         },
+        index_metrics: index.metrics(),
         decisions,
     })
 }
@@ -151,6 +183,7 @@ fn synthetic_request(request_idx: u32, config: SyntheticWorkloadConfig) -> Reque
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quillcache_router::LeastLoadedRouter;
 
     #[test]
     fn synthetic_workload_reuses_shared_prefix_after_first_request() {
@@ -165,7 +198,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.total_requests, 4);
+        assert_eq!(report.policy, "greedy-state-plane");
+        assert_eq!(report.index_backend, "memory");
         assert!(report.cache_reusable_blocks >= 3);
         assert_eq!(report.decisions.len(), 4);
+    }
+
+    #[test]
+    fn experiment_mode_compares_policies_on_the_same_backend() {
+        let config = SyntheticWorkloadConfig::default();
+        let greedy = run_synthetic_with(
+            &GreedyStatePlaneRouter::default(),
+            &mut MemoryIndex::new(),
+            config,
+        )
+        .unwrap();
+        let least = run_synthetic_with(
+            &LeastLoadedRouter::default(),
+            &mut MemoryIndex::new(),
+            config,
+        )
+        .unwrap();
+
+        assert_eq!(greedy.policy, "greedy-state-plane");
+        assert_eq!(least.policy, "least-loaded");
+        assert_eq!(greedy.index_backend, "memory");
+        assert_eq!(least.index_backend, "memory");
+        // Both policies replay the full workload, so the backend sees the same
+        // number of residency writes regardless of which worker was chosen.
+        assert_eq!(greedy.index_metrics.puts, least.index_metrics.puts);
+        assert_eq!(greedy.total_requests, least.total_requests);
     }
 }

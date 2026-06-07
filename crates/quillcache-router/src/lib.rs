@@ -1,4 +1,6 @@
-use quillcache_core::{CacheResidency, CacheTier, CostModel, KvBlockKey, RequestShape, WorkerState};
+use quillcache_core::{
+    CacheResidency, CacheTier, CostModel, KvBlockKey, RequestShape, WorkerState,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -333,13 +335,20 @@ mod tests {
         ];
         for policy in &policies {
             let decision = policy.route(&request, &workers, &residency).unwrap();
-            assert!(!decision.worker_id.is_empty(), "{} produced no worker", policy.name());
+            assert!(
+                !decision.worker_id.is_empty(),
+                "{} produced no worker",
+                policy.name()
+            );
         }
 
         // Cache-aware greedy must follow residency to w1; the load-only baseline
         // ignores residency and (with equal load) falls back to the first worker.
         assert_eq!(
-            policies[0].route(&request, &workers, &residency).unwrap().worker_id,
+            policies[0]
+                .route(&request, &workers, &residency)
+                .unwrap()
+                .worker_id,
             "w1"
         );
     }

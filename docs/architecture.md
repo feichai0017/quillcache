@@ -55,23 +55,36 @@ claim; it exists to make baselines and traces executable.
 
 ## Residency Index Boundary
 
-`quillcache-control` owns the index boundary through `ResidencyIndexStore`.
-The gateway and router depend on that trait, not on a concrete storage engine.
+The index boundary is the single trait `quillcache_core::IndexBackend`. Backends
+implement it depending only on `quillcache-core`. The gateway, control plane, and
+router depend on the trait, never on a concrete storage engine.
 
-The v0.1 backend is `MemoryResidencyIndex`, which keeps:
+`quillcache-control` translates KV events into residency updates through the
+backend-agnostic `ingest_batch(&mut dyn IndexBackend, ...)`, so identity
+resolution (model/tokenizer/adapter/tenant) happens once and every backend sees
+the same `put` / `remove_block` / `clear_worker` calls. `ControlPlane` holds a
+`Box<dyn IndexBackend>` and can be constructed with `with_index(...)` to swap
+backends at runtime.
+
+The v0.1 backend is `MemoryIndex`, which keeps:
 
 ```text
 KvBlockKey -> Vec<CacheResidency>
 ```
+
+`IndexBackend` is identity-aware (`IdentityScope`), supports an identity-scoped
+`prefix_scan` (the ART/radix strength), and reports comparable `IndexMetrics`
+(including `bytes_written` for write-amplification studies and a `persistent()`
+flag for recovery studies).
 
 The planned persistent backend is Holt. Holt should store prefix/residency
 metadata and recovery state. It should not become the component that moves KV
 tensors between GPU, DRAM, SSD, or remote memory. That responsibility belongs to
 the inference engine and data-plane connectors.
 
-This split leaves room for ART-vs-LSM research: Holt can implement the same
-trait as a RocksDB baseline while the gateway, event ingest, and router stay
-unchanged.
+This split leaves room for ART-vs-LSM research: Holt and a RocksDB baseline
+implement the same `IndexBackend` trait while the gateway, event ingest, and
+router stay unchanged.
 
 ## MVP Gateway
 
