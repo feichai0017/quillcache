@@ -1,145 +1,107 @@
-# QuillSQL
+# QuillCache
 
-QuillSQL is a frontend-agnostic Arrow/MLIR query compiler and JIT execution
-engine. DataFusion is the default frontend today; DuckDB, Spark, Substrait, or
-other engines can be added through adapters that lower their plans into the same
-`PipelineGraph`.
+QuillCache is a research and engineering platform for an **inference state
+plane**: a system layer that treats LLM KV cache blocks as first-class,
+routable, tiered state.
 
-[![Crates.io](https://img.shields.io/crates/v/quill-sql.svg)](https://crates.io/crates/quill-sql)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Mentioned in Awesome](https://awesome.re/mentioned-badge.svg)](https://github.com/rust-unofficial/awesome-rust#database)
-[![Discord](https://img.shields.io/discord/1458041939587764247?label=Discord&logo=discord&logoColor=white)](https://discord.gg/dJqa4RYW65)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/feichai0017/QuillSQL)
+The project has moved on from the old Arrow/MLIR query compiler direction. The
+active build surface is now focused on distributed KV cache research.
 
-<div align="center">
-  <img src="/public/rust-db.png" alt="QuillSQL" width="640"/>
-  <p><em>Frontend adapters, Arrow batches, and an MLIR JIT execution core.</em></p>
-</div>
+## Research Boundary
 
-## Architecture
+QuillCache studies the control-plane and storage-system problems around KV
+cache reuse:
+
+- content-addressed KV block identity across model, tokenizer, adapter, and
+  tenant boundaries
+- cache-aware routing for prefill/decode disaggregated serving
+- reuse versus transfer versus recompute decisions under TTFT and TPOT SLOs
+- tiered placement across GPU HBM, remote GPU memory, CPU DRAM, local SSD, and
+  object storage
+- agent/session-aware cache lifetime, pinning, prefetch, and eviction
+
+The project does not implement an LLM kernel, an ANN index, or a full inference
+engine. The intended integration targets are systems such as vLLM, SGLang,
+LMCache, Mooncake, Dynamo/NIXL, llm-d, and KServe.
+
+## Platform Architecture
 
 ```mermaid
 flowchart LR
-    F["Frontend adapters\nDataFusion default\nDuckDB / Spark future"]
-    P["quill-plan\nPipelineGraph"]
-    J["quill-jit\ncompile + select"]
-    M["quill-mlir\nMLIR dialect + passes"]
-    R["quill-runtime\nArrow kernels"]
-    O["Arrow RecordBatch"]
+    C["Client / benchmark"]
+    G["quillcache-gateway\nOpenAI-compatible proxy"]
+    I["quillcache-core\nKV block identity\nworker state\ncost model"]
+    P["quillcache-control\nresidency index\npolicy service"]
+    R["quillcache-router\nreuse / transfer / recompute routing"]
+    S["quillcache-sim\ntrace simulator\npolicy experiments"]
+    E["vLLM / SGLang / LMCache\nKV events and requests"]
 
-    F --> P --> J --> M --> R --> O
+    C --> G --> P
+    E --> G
+    P --> I
     P --> R
+    S --> R
+    G --> E
 ```
-
-The stable boundary is `PipelineGraph`, not DataFusion. A frontend adapter owns
-plan inspection and replacement. QuillSQL owns the neutral pipeline model, MLIR
-lowering, Arrow runtime, and compiled execution path.
-
-Operator semantics live in `quill-plan`; fusion policy lives in
-`quill-jit`. `PipelineGraph` keeps semantic operators such as `filter`,
-`project`, `plain_aggregate`, and `group_aggregate`; the `quill-jit` fusion registry
-selects supported fragments, and MLIR lowering turns those fragments into fused
-loops. That keeps frontend adapters thin and avoids query-specific fused
-operators.
 
 ## Packages
 
 | Package | Role |
 | ------- | ---- |
-| `quill-sql` | CLI, server, benchmarks, and release metadata. |
-| `quill-core` | Public `Database` API and DataFusion-backed shell integration. |
-| `quill-df` | Default DataFusion frontend adapter and `CompiledPipelineExec`. |
-| `quill-plan` | Frontend-neutral `PipelineGraph`, expressions, types, operators, stages, and sinks. |
-| `quill-jit` | Fusion registry, JIT orchestration, frontend adapter trait, dialect emission, and MLIR backend. |
-| `quill-runtime` | Arrow binding, safety checks, fixed-width kernels, and result materialization. |
-| `quill-mlir` | C++/TableGen MLIR dialect and lowering pass package. |
-
-## Why `quill-mlir` Is Native
-
-Rust builds pipeline graphs, integrates with DataFusion, and manages Arrow
-batches. The formal MLIR dialect, TableGen operation definitions, verifiers, and
-pass registration live in `quill-mlir` because those are native MLIR C++ API
-surfaces. Rust calls into that package through `melior`.
-
-Current compiled coverage is intentionally narrow: fixed-width
-`filter -> project -> record_batch`, fixed-width `filter -> SUM`, including the
-Q6-style `Date32`/`Decimal128` case, and dense `group_ids -> group_update`
-state updates for Q1-style pipelines. Runtime still owns Arrow binding, key interning, dense
-group id assignment, and final materialization; full MLIR hash probe/insert is a
-later step. Unsupported expressions or unsafe Arrow layouts stay on the safe
-Rust runtime or DataFusion path.
+| `quillcache` | CLI for research plans and simulator runs. |
+| `quillcache-control` | Residency index and policy-facing control-plane state. |
+| `quillcache-core` | KV block keys, worker/cache residency state, SLO targets, and cost model. |
+| `quillcache-gateway` | OpenAI-compatible proxy and KV event ingest service. |
+| `quillcache-router` | Greedy baseline router that selects reuse, transfer, or recompute per block. |
+| `quillcache-sim` | Synthetic trace generator and simulator for first routing experiments. |
 
 ## Quick Start
 
 ```bash
-cargo run --bin client
+cargo run -- simulate
+cargo run -- simulate --requests 64 --workers 4 --shared-prefix-blocks 12
+cargo run -- simulate --json
+cargo run -- plan
+cargo run -- gateway --config examples/quillcache-gateway.yaml
 
-# keep DataFusion scratch state under a chosen directory
-cargo run --bin client -- --data-dir .quillsql-data
-
-# start web server at http://127.0.0.1:8080
-cargo run --bin server
+cargo test --workspace
 ```
 
-Sample session:
+The current MVP includes a gateway and HTTP event ingest path. See
+[`docs/positioning.md`](docs/positioning.md),
+[`docs/platform-plan.md`](docs/platform-plan.md),
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/index-backends.md`](docs/index-backends.md), and
+[`docs/mvp-runbook.md`](docs/mvp-runbook.md) for the platform definition,
+architecture, index-backend plan, and vLLM runbook.
 
-```sql
-CREATE TABLE t AS SELECT 1 AS id, 10 AS v;
-INSERT INTO t VALUES (2, 20), (3, 30);
+## v0.1 Artifacts
 
-SELECT id, v FROM t WHERE v > 10 ORDER BY id DESC LIMIT 1;
-EXPLAIN SELECT id, COUNT(*) FROM t GROUP BY id ORDER BY id;
-```
+- OpenAI-compatible gateway for `/v1/chat/completions` and `/v1/completions`.
+- Vendor-neutral `/v1/kv-events` ingest API.
+- `/v1/state` debug endpoint with engines, workers, index stats, and residency.
+- vLLM ZMQ/msgpack KV event bridge.
+- Greedy cache-aware router with local-hit, transfer, and recompute accounting.
+- Pluggable `ResidencyIndexStore` boundary with an in-memory v0.1 backend.
 
-Parquet datasets can be registered through `Database::register_parquet`:
+## Research Milestones
 
-```rust
-db.register_parquet("events", "/data/events.parquet").await?;
-let out = db.run("SELECT count(*) FROM events WHERE user_id IS NOT NULL").await?;
-```
+1. Build a trace simulator for chat, RAG, and agentic workloads.
+2. Define a KV block object model with explicit model/tokenizer/adapter/tenant
+   identity.
+3. Compare round-robin, cache-aware, SLO-aware, and network-aware routing.
+4. Add tiered placement and eviction policies for HBM, DRAM, SSD, and remote
+   pools.
+5. Integrate with vLLM or SGLang through KV events and existing transfer/offload
+   connector surfaces.
+6. Add Holt and RocksDB residency-index backends for ART-vs-LSM measurement.
+7. Evaluate against local prefix caching, LMCache-style external cache, and
+   Mooncake-style distributed KV pool baselines.
 
-## JIT And Benchmarks
+## Current Non-Goals
 
-```bash
-# Requires LLVM/MLIR 22. Homebrew's llvm package works on macOS.
-export MLIR_SYS_220_PREFIX=/opt/homebrew/opt/llvm
-export LLVM_SYS_220_PREFIX=/opt/homebrew/opt/llvm
-
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo bench --no-run
-
-QUILL_JIT=mlir \
-cargo bench --bench tpch -- q6_scan_filter_aggregate
-```
-
-Benchmark harnesses:
-
-- `jit_micro`: lowering, MLIR compile, MLIR kernel, and small SQL paths.
-- `tpch`: Q6/Q1/Q3 analytical ladder over generated or external Parquet data.
-
-Useful knobs:
-
-- `QUILL_JIT=off`: pure DataFusion baseline.
-- `QUILL_JIT=mlir`: executable MLIR kernels. This is the default mode.
-- `QUILL_TPCH_SF=<scale>`: choose generated TPC-H scale factor. The default is
-  SF1.
-- `QUILL_TPCH_DIR=/path/to/tpch-parquet`: use an existing Parquet dataset.
-
-## Scope
-
-QuillSQL is no longer a teaching page-store database. It does not ship a custom
-buffer pool, WAL, table heap, index manager, storage engine, SQL transaction
-layer, or external KV adapter. The project is now focused on query compilation:
-frontend plans in, Arrow batches out.
-
-## Acknowledgements
-
-- [Apache DataFusion](https://datafusion.apache.org/)
-- [Apache Arrow](https://arrow.apache.org/)
-- [MLIR](https://mlir.llvm.org/)
-- [melior](https://github.com/mlir-rs/melior)
-
-## Community
-
-Discord: https://discord.gg/dJqa4RYW65
+- no custom transformer kernels
+- no model weight serving
+- no vector database
+- no SQL frontend
+- no production multi-tenant isolation guarantee yet

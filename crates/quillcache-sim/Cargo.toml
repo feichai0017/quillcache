@@ -1,0 +1,12 @@
+[package]
+name = "quillcache-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Simulation harness for QuillCache research"
+license = "MIT"
+
+[dependencies]
+quillcache-core = { path = "../quillcache-core", version = "0.1.0" }
+quillcache-router = { path = "../quillcache-router", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }

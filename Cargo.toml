@@ -1,76 +1,49 @@
 [workspace]
 members = [
     ".",
-    "crates/quill-core",
-    "crates/quill-df",
-    "crates/quill-jit",
-    "crates/quill-mlir",
-    "crates/quill-plan",
-    "crates/quill-runtime",
+    "crates/quillcache-control",
+    "crates/quillcache-core",
+    "crates/quillcache-gateway",
+    "crates/quillcache-router",
+    "crates/quillcache-sim",
 ]
 default-members = [
     ".",
-    "crates/quill-core",
-    "crates/quill-df",
-    "crates/quill-jit",
-    "crates/quill-mlir",
-    "crates/quill-plan",
-    "crates/quill-runtime",
+    "crates/quillcache-control",
+    "crates/quillcache-core",
+    "crates/quillcache-gateway",
+    "crates/quillcache-router",
+    "crates/quillcache-sim",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-arrow = "58.3.0"
-axum = { version = "0.7", features = ["macros", "json"] }
-clap = { version = "4.3.19", features = ["derive", "cargo"] }
-comfy-table = "7.1.0"
-criterion = { version = "0.5", features = ["html_reports"] }
-datafusion = { version = "53.1.0", default-features = false, features = ["parquet", "sql"] }
-env_logger = "0.11.5"
-futures = "0.3.31"
-melior = "0.27.0"
-mlir-sys = "220.0.2"
-rustyline = "15.0.0"
+axum = "0.8"
+clap = { version = "4.5.23", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
-tempfile = "3.12.0"
+serde_json = "1.0"
+serde_yaml = "0.9"
 thiserror = "2.0.12"
-tokio = { version = "1.41.1", features = ["full"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
-tpchgen-cli = "2.0.2"
+tokio = { version = "1.42", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package]
-name = "quill-sql"
-version = "0.3.1"
+name = "quillcache"
+version = "0.1.0"
 edition = "2021"
-description = "Frontend-agnostic Arrow/MLIR query compiler and JIT execution engine"
+description = "Research prototype for an inference state plane and distributed KV cache manager"
 license = "MIT"
-repository = "https://github.com/feichai0017/quillsql"
+repository = "https://github.com/feichai0017/quillcache"
 readme = "README.md"
 
 [dependencies]
-axum = { workspace = true }
 clap = { workspace = true }
-env_logger = { workspace = true }
-quill-core = { version = "0.3.1", path = "crates/quill-core" }
-quill-jit = { version = "0.3.1", path = "crates/quill-jit" }
-rustyline = { workspace = true }
-serde = { workspace = true }
+quillcache-core = { version = "0.1.0", path = "crates/quillcache-core" }
+quillcache-gateway = { version = "0.1.0", path = "crates/quillcache-gateway" }
+quillcache-router = { version = "0.1.0", path = "crates/quillcache-router" }
+quillcache-sim = { version = "0.1.0", path = "crates/quillcache-sim" }
+serde_json = { workspace = true }
 tokio = { workspace = true }
-tower-http = { workspace = true }
-
-[dev-dependencies]
-arrow = { workspace = true }
-criterion = { workspace = true }
-datafusion = { workspace = true }
-quill-plan = { version = "0.3.1", path = "crates/quill-plan" }
-quill-runtime = { version = "0.3.1", path = "crates/quill-runtime" }
-tempfile = { workspace = true }
-tpchgen-cli = { workspace = true }
-
-[[bench]]
-name = "jit_micro"
-harness = false
-
-[[bench]]
-name = "tpch"
-harness = false
+tracing-subscriber = { workspace = true }

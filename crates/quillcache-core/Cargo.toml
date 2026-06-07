@@ -1,0 +1,10 @@
+[package]
+name = "quillcache-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core data model and cost model for QuillCache"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

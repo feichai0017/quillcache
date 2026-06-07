@@ -1,0 +1,11 @@
+[package]
+name = "quillcache-router"
+version = "0.1.0"
+edition = "2021"
+description = "Routing policies for QuillCache"
+license = "MIT"
+
+[dependencies]
+quillcache-core = { path = "../quillcache-core", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }

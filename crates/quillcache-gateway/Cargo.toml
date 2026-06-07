@@ -1,0 +1,18 @@
+[package]
+name = "quillcache-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible gateway and event ingest service for QuillCache"
+license = "MIT"
+
+[dependencies]
+axum = { workspace = true }
+quillcache-control = { path = "../quillcache-control", version = "0.1.0" }
+quillcache-core = { path = "../quillcache-core", version = "0.1.0" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

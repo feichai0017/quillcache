@@ -1,0 +1,16 @@
+bind: 127.0.0.1:8080
+engines:
+  - id: vllm-a
+    kind: Vllm
+    base_url: http://127.0.0.1:8001
+    model_id: Qwen/Qwen3-0.6B
+    tokenizer_id: Qwen/Qwen3-0.6B
+    tenant_id: default
+    locality_domain: local-a
+  - id: vllm-b
+    kind: Vllm
+    base_url: http://127.0.0.1:8002
+    model_id: Qwen/Qwen3-0.6B
+    tokenizer_id: Qwen/Qwen3-0.6B
+    tenant_id: default
+    locality_domain: local-a
