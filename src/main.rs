@@ -121,9 +121,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let report = match backend.as_str() {
                 "memory" => bench_index(&mut MemoryIndex::new(), config),
+                #[cfg(feature = "rocksdb")]
+                "rocksdb" => bench_rocksdb(config)?,
                 other => {
                     return Err(format!(
-                        "unknown index backend '{other}' (available: memory; rocksdb/holt land in M1b/M2)"
+                        "unknown index backend '{other}' (available: memory, rocksdb [build with --features rocksdb]; holt lands in M2)"
                     )
                     .into())
                 }
@@ -146,14 +148,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.scan_queries
                 );
                 println!(
-                    "resident blocks: {} · bytes_written: {}",
+                    "resident blocks: {} · bytes_written (on-disk): {}",
                     report.metrics.resident_blocks, report.metrics.bytes_written
                 );
+                if let Some(ms) = report.recovery_ms {
+                    println!("recovery (reopen from disk): {:.2} ms", ms);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+fn bench_rocksdb(
+    config: IndexBenchConfig,
+) -> Result<quillcache_sim::IndexBenchReport, Box<dyn std::error::Error>> {
+    use quillcache_core::IndexBackend;
+    use quillcache_index_rocksdb::RocksIndex;
+
+    let dir = std::env::temp_dir().join(format!("quillcache-bench-rocksdb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut index = RocksIndex::open(&dir)?;
+    let mut report = bench_index(&mut index, config);
+    // Merge to one level so the reported on-disk size reflects the compacted state.
+    index.compact();
+    report.metrics = index.metrics();
+    drop(index);
+
+    // Recovery: reopen the index from disk and time it.
+    let started = std::time::Instant::now();
+    let reopened = RocksIndex::open(&dir)?;
+    let recovery_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let _ = reopened.len();
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    report.recovery_ms = Some(recovery_ms);
+    Ok(report)
 }
 
 fn print_plan() {

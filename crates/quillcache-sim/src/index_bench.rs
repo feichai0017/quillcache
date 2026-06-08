@@ -52,6 +52,8 @@ pub struct IndexBenchReport {
     pub scan_mean_us: f64,
     pub scan_p50_us: f64,
     pub scan_p99_us: f64,
+    /// Reopen-from-disk time for persistent backends; `None` for in-memory.
+    pub recovery_ms: Option<f64>,
     pub metrics: IndexMetrics,
 }
 
@@ -155,6 +157,7 @@ pub fn bench_index<B: IndexBackend + ?Sized>(
         scan_mean_us,
         scan_p50_us,
         scan_p99_us,
+        recovery_ms: None,
         metrics: backend.metrics(),
     }
 }

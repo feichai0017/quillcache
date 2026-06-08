@@ -1,0 +1,13 @@
+[package]
+name = "quillcache-index-rocksdb"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "RocksDB (LSM) residency-index backend for QuillCache"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+quillcache-core = { path = "../quillcache-core", version = "1.0.0-alpha.1" }
+rocksdb = "0.22"
+serde_json = { workspace = true }
+thiserror = { workspace = true }

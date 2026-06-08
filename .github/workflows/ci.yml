@@ -26,10 +26,35 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude quillcache-index-rocksdb --all-targets -- -D warnings
 
       - name: build
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude quillcache-index-rocksdb
 
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude quillcache-index-rocksdb
+
+  rocksdb:
+    name: rocksdb backend (LSM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang/libclang (librocksdb-sys bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy -p quillcache-index-rocksdb --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test -p quillcache-index-rocksdb
+
+      - name: build CLI with rocksdb feature
+        run: cargo build -p quillcache --features rocksdb
