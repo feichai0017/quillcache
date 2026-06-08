@@ -16,20 +16,24 @@ precisely, run bridge/vllm_kv_bridge.py as a sidecar in this container (see the
 runbook). For a first run you can skip events and just proxy requests to get real
 TTFT from bench/run_trace.py.
 """
+import os
 import subprocess
 
 import modal
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-VLLM_VERSION = "0.6.6"
 
-image = modal.Image.debian_slim().pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub")
+image = modal.Image.debian_slim(python_version="3.12").pip_install("vllm", "huggingface_hub")
 app = modal.App("quillcache-vllm")
 
 
 @app.function(gpu="L4", image=image, timeout=60 * 60, max_containers=1)
 @modal.web_server(8000, startup_timeout=600)
 def serve():
+    # flashinfer JIT-compiles its sampler kernel at runtime and needs nvcc,
+    # which the slim image lacks. Use vLLM's native sampler (no JIT, no nvcc).
+    # The model forward (attention) uses a prebuilt backend and is unaffected.
+    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     cmd = [
         "vllm",
         "serve",
@@ -41,8 +45,9 @@ def serve():
         "--max-model-len",
         "4096",
         "--enable-prefix-caching",
-        # Publish KV cache events over ZMQ for bridge/vllm_kv_bridge.py.
-        "--kv-events-config",
-        '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557"}',
+        # Tier 2 (precise KV residency): add the two lines below and run
+        # bridge/vllm_kv_bridge.py as a sidecar — see docs/m3-real-vllm.md.
+        #   "--kv-events-config",
+        #   '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557"}',
     ]
     subprocess.Popen(" ".join(cmd), shell=True)

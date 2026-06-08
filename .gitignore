@@ -20,3 +20,8 @@ AGENTS.md
 GEMINI.md
 /docs/book
 /benchdata
+
+# Python (bench/ bridge/ deploy/ scripts)
+__pycache__/
+*.pyc
+.venv/
