@@ -53,6 +53,8 @@ enum Command {
         block_bytes: u64,
         #[arg(long, default_value_t = 20000)]
         scan_queries: u32,
+        #[arg(long, default_value_t = 0)]
+        churn_ops: u32,
         #[arg(long)]
         json: bool,
     },
@@ -109,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             block_tokens,
             block_bytes,
             scan_queries,
+            churn_ops,
             json,
         } => {
             let config = IndexBenchConfig {
@@ -118,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 block_tokens,
                 block_bytes,
                 scan_queries,
+                churn_ops,
             };
             let report = match backend.as_str() {
                 "memory" => bench_index(&mut MemoryIndex::new(), config),
@@ -143,12 +147,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.ingest_puts_per_sec, report.ingest_secs
                 );
                 println!(
-                    "prefix_scan: p50 {:.2} us · p99 {:.2} us · mean {:.2} us ({} queries)",
+                    "prefix_scan: p50 {:.2} · p99 {:.2} · p999 {:.2} · mean {:.2} us ({} queries)",
                     report.scan_p50_us,
                     report.scan_p99_us,
+                    report.scan_p999_us,
                     report.scan_mean_us,
                     report.scan_queries
                 );
+                if report.churn_ops > 0 {
+                    println!(
+                        "churn: {:.0} ops/sec ({} cycles, {:.3}s)",
+                        report.churn_ops_per_sec, report.churn_ops, report.churn_secs
+                    );
+                }
                 println!(
                     "resident blocks: {} · bytes_written (on-disk): {}",
                     report.metrics.resident_blocks, report.metrics.bytes_written
