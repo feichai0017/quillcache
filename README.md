@@ -71,7 +71,7 @@ mode runs one chosen combination in front of real engines.
 | --- | --- | --- | --- |
 | Inference engine / connector | `EngineEndpoint` + KV events | vLLM (OpenAI-compatible + KV events) | SGLang, LMCache events |
 | Routing policy | `quillcache_core` → `quillcache_router::RoutingPolicy` | `LeastLoadedRouter` (baseline), `GreedyStatePlaneRouter` (cache-aware) | SLO-aware, session/DAG-aware |
-| Index backend | `quillcache_core::IndexBackend` | `MemoryIndex` (reference) | **Holt** (ART), **RocksDB** (LSM), filesystem |
+| Index backend | `quillcache_core::IndexBackend` | `MemoryIndex` (reference), **Holt** (ART), **RocksDB** (LSM) | filesystem |
 
 ## Two "KV"s, two "backends" (read this first)
 
@@ -103,6 +103,27 @@ point-lookup p50/p99, ingest throughput, restart recovery time, on-disk size. A
 recently published RocksDB/LSM approach left write amplification unanalyzed —
 that gap is the first measurable result.
 
+### First results
+
+Same workload (2000 requests, 8016 resident blocks, 20k `prefix_scan` queries),
+same `IndexBackend` trait, via `quillcache bench-index`:
+
+| backend | ingest (puts/s) | prefix_scan p50 | prefix_scan p99 | recovery | on-disk |
+| --- | --- | --- | --- | --- | --- |
+| memory (flat map) | 706k | 494 µs | 1685 µs | — | 0 |
+| rocksdb (LSM) | 56k | 16.8 µs | 29.6 µs | 4.1 ms | 500 KB |
+| **holt (ART)** | 55k | **9.96 µs** | **13.7 µs** | **2.6 ms** | 8.4 MB |
+
+For the prefix-heavy residency workload, **ART (Holt) gives the lowest
+prefix-scan latency** (~1.7× faster than LSM at p50, ~2.2× at p99; ~50× faster
+than the flat in-memory map's O(N) scan) and the fastest recovery. **LSM
+(RocksDB) is far more space-efficient on disk** (compression + compaction).
+Ingest is comparable between the two persistent backends and ~13× slower than
+in-memory — the cost of durability. So pick ART when prefix-scan latency and
+recovery dominate (the common case for a residency index queried per request),
+pick LSM when on-disk footprint is the constraint. Numbers are from one machine;
+reproduce with `cargo run --features "rocksdb holt" -- bench-index --backend <b>`.
+
 ## Packages
 
 | Package | Role |
@@ -113,6 +134,8 @@ that gap is the first measurable result.
 | `quillcache-control` | `ControlPlane` and the backend-agnostic `ingest_batch` (KV events → residency). |
 | `quillcache-gateway` | OpenAI-compatible proxy + `/v1/kv-events` ingest + `/v1/state`. |
 | `quillcache-sim` | Experiment-mode harness: replay a trace over any policy × any backend. |
+| `quillcache-index-rocksdb` | RocksDB (LSM) `IndexBackend` (optional `rocksdb` feature; needs a C++ toolchain). |
+| `quillcache-index-holt` | Holt (persistent ART) `IndexBackend` (optional `holt` feature; pure Rust). |
 
 ## Quick start
 
@@ -122,6 +145,11 @@ that gap is the first measurable result.
 cargo run -- simulate
 cargo run -- simulate --requests 64 --workers 4 --shared-prefix-blocks 12
 cargo run -- simulate --json
+
+# Compare index storage engines (memory vs LSM vs ART) on one trace.
+cargo run --features "rocksdb holt" -- bench-index --backend memory
+cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
+cargo run --features "rocksdb holt" -- bench-index --backend holt
 
 # Print the research plan / build order.
 cargo run -- plan
@@ -156,12 +184,12 @@ exact block hashes while keeping the upstream request clean. See
 - ✅ Single `IndexBackend` seam with an in-memory reference backend + identity-aware prefix scan.
 - ✅ Pluggable `RoutingPolicy` with a load-only baseline and a cache-aware policy.
 - ✅ Experiment harness comparing policies × backends on one trace.
-- ⏳ Holt (ART) and RocksDB (LSM) index backends + ART-vs-LSM benchmark.
+- ✅ Holt (ART) and RocksDB (LSM) index backends + `bench-index` ART-vs-LSM comparison.
 - ⏳ vLLM ZMQ/msgpack KV-event bridge wired end-to-end; SGLang connector.
 
 ## Roadmap
 
-1. Holt (ART) and RocksDB (LSM) `IndexBackend`s; run the ART-vs-LSM benchmark.
+1. ✅ Holt (ART) + RocksDB (LSM) `IndexBackend`s + ART-vs-LSM benchmark — done; next: deepen it (true write-amplification, Holt compaction/on-disk, larger traces).
 2. SLO-aware and session/DAG-aware routing policies.
 3. Real vLLM/SGLang KV-event connectors end-to-end; chat / RAG / agent traces.
 4. Tiered placement and eviction across HBM / DRAM / SSD / remote.

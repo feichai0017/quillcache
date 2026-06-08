@@ -42,8 +42,8 @@ make stronger safety claims.
 | Backend | Status | Purpose |
 | --- | --- | --- |
 | Memory | v0.1 implemented | Fast smoke tests, routing experiments, and local gateway demos. |
-| Holt ART | planned | Persistent prefix/residency index with prefix-native lookups and crash recovery. |
-| RocksDB/LSM | planned baseline | Compare write amplification, recovery, and prefix-scan behavior against ART. |
+| Holt ART | implemented | Persistent prefix/residency index with prefix-native lookups and crash recovery (`quillcache-index-holt`). |
+| RocksDB/LSM | implemented | LSM baseline for write amplification, recovery, and prefix-scan vs ART (`quillcache-index-rocksdb`). |
 | Filesystem catalog | planned baseline | Emulate simple block catalog designs used by file-backed KV offload systems. |
 
 ## Holt Integration Shape

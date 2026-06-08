@@ -34,6 +34,9 @@ jobs:
       - name: test
         run: cargo test --workspace --exclude quillcache-index-rocksdb
 
+      - name: build CLI with holt feature
+        run: cargo build -p quillcache --features holt
+
   rocksdb:
     name: rocksdb backend (LSM)
     runs-on: ubuntu-latest

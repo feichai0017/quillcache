@@ -123,9 +123,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "memory" => bench_index(&mut MemoryIndex::new(), config),
                 #[cfg(feature = "rocksdb")]
                 "rocksdb" => bench_rocksdb(config)?,
+                #[cfg(feature = "holt")]
+                "holt" => bench_holt(config)?,
                 other => {
                     return Err(format!(
-                        "unknown index backend '{other}' (available: memory, rocksdb [build with --features rocksdb]; holt lands in M2)"
+                        "unknown index backend '{other}' (available: memory, rocksdb, holt — build with --features rocksdb,holt)"
                     )
                     .into())
                 }
@@ -181,6 +183,35 @@ fn bench_rocksdb(
     // Recovery: reopen the index from disk and time it.
     let started = std::time::Instant::now();
     let reopened = RocksIndex::open(&dir)?;
+    let recovery_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let _ = reopened.len();
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    report.recovery_ms = Some(recovery_ms);
+    Ok(report)
+}
+
+#[cfg(feature = "holt")]
+fn bench_holt(
+    config: IndexBenchConfig,
+) -> Result<quillcache_sim::IndexBenchReport, Box<dyn std::error::Error>> {
+    use quillcache_core::IndexBackend;
+    use quillcache_index_holt::HoltIndex;
+
+    let dir = std::env::temp_dir().join(format!("quillcache-bench-holt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut index = HoltIndex::open(&dir).map_err(|e| format!("holt open: {e:?}"))?;
+    let mut report = bench_index(&mut index, config);
+    // Checkpoint the WAL so the reported on-disk size reflects all writes.
+    index.flush();
+    report.metrics = index.metrics();
+    drop(index);
+
+    // Recovery: reopen the index from disk (WAL replay) and time it.
+    let started = std::time::Instant::now();
+    let reopened = HoltIndex::open(&dir).map_err(|e| format!("holt reopen: {e:?}"))?;
     let recovery_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let _ = reopened.len();
     drop(reopened);

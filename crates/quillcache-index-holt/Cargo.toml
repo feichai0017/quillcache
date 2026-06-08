@@ -1,0 +1,12 @@
+[package]
+name = "quillcache-index-holt"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "Holt (persistent adaptive-radix-tree) residency-index backend for QuillCache"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+quillcache-core = { path = "../quillcache-core", version = "1.0.0-alpha.1" }
+holt = "0.5.4"
+serde_json = { workspace = true }
