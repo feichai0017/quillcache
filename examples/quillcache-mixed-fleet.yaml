@@ -1,0 +1,25 @@
+# QuillCache over a MIXED engine fleet — vLLM and SGLang behind one control
+# plane. Both speak the OpenAI-compatible API, so the gateway proxies either; the
+# `kind` is metadata used for engine-specific KV-event adapters (the bridge).
+#
+# Backed by a persistent ART (Holt) residency index, with SLO-aware routing.
+# Run: cargo run --features holt -- gateway --config examples/quillcache-mixed-fleet.yaml
+bind: 127.0.0.1:8080
+policy: slo-aware          # greedy | prefix-affinity | session-affinity | slo-aware | round-robin | least-loaded
+index: holt                # memory | holt (persistent ART) | rocksdb (persistent LSM)
+index_path: quillcache-residency
+engines:
+  - id: vllm-a
+    kind: Vllm
+    base_url: http://127.0.0.1:8001
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    tokenizer_id: Qwen/Qwen2.5-7B-Instruct
+    tenant_id: default
+    locality_domain: rack-a
+  - id: sglang-a
+    kind: Sglang
+    base_url: http://127.0.0.1:30000
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    tokenizer_id: Qwen/Qwen2.5-7B-Instruct
+    tenant_id: default
+    locality_domain: rack-a

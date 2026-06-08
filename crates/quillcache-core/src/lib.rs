@@ -745,6 +745,81 @@ impl IndexBackend for MemoryIndex {
     }
 }
 
+/// A KV **tensor** data plane (LMCache / NVIDIA Dynamo KVBM / Tencent FlexKV)
+/// that QuillCache's control plane sits *above*. QuillCache owns metadata and
+/// decisions; a data plane actually stores and moves the KV tensor bytes across
+/// tiers (HBM / DRAM / SSD / remote). This trait is the seam where such a system
+/// plugs in: the control plane can ask where a block's bytes live and what
+/// fetching them would cost, without ever owning the tensors. The default
+/// [`NoDataPlane`] means "infer placement from routing + KV events alone".
+pub trait DataPlane: std::fmt::Debug + Send + Sync {
+    /// Stable name for reports (for example "none", "mock", "lmcache").
+    fn name(&self) -> &str;
+
+    /// The tier a block's KV bytes currently occupy on `worker_id`, if resident.
+    fn tier_of(&self, worker_id: &str, key: &KvBlockKey) -> Option<CacheTier>;
+
+    /// Estimated microseconds to make the block available on `worker_id` (fetch
+    /// / transfer / load from its tier). `None` if the data plane can't say.
+    fn fetch_cost_us(&self, worker_id: &str, key: &KvBlockKey) -> Option<u64>;
+}
+
+/// No external data plane: QuillCache infers residency from routing decisions
+/// and KV events alone (the default — there is no separate tensor store to ask).
+#[derive(Debug, Default)]
+pub struct NoDataPlane;
+
+impl DataPlane for NoDataPlane {
+    fn name(&self) -> &str {
+        "none"
+    }
+    fn tier_of(&self, _worker_id: &str, _key: &KvBlockKey) -> Option<CacheTier> {
+        None
+    }
+    fn fetch_cost_us(&self, _worker_id: &str, _key: &KvBlockKey) -> Option<u64> {
+        None
+    }
+}
+
+/// In-memory reference data plane for tests and demos: records which tier each
+/// `(worker, block)` lives in and reports a tier-derived fetch cost. A real
+/// LMCache / KVBM / FlexKV adapter implements [`DataPlane`] the same way over a
+/// live tensor store.
+#[derive(Debug, Default)]
+pub struct MockDataPlane {
+    tiers: HashMap<(String, KvBlockKey), CacheTier>,
+    cost: CostModel,
+}
+
+impl MockDataPlane {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a block's KV bytes occupy `tier` on `worker_id`.
+    pub fn place(&mut self, worker_id: impl Into<String>, key: KvBlockKey, tier: CacheTier) {
+        self.tiers.insert((worker_id.into(), key), tier);
+    }
+}
+
+impl DataPlane for MockDataPlane {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn tier_of(&self, worker_id: &str, key: &KvBlockKey) -> Option<CacheTier> {
+        self.tiers
+            .get(&(worker_id.to_string(), key.clone()))
+            .copied()
+    }
+
+    fn fetch_cost_us(&self, worker_id: &str, key: &KvBlockKey) -> Option<u64> {
+        let tier = self.tier_of(worker_id, key)?;
+        let bytes = u64::from(key.token_count) * 128 * 1024;
+        Some(self.cost.transfer_cost_us(tier, bytes, true, true))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +831,25 @@ mod tests {
             cost.transfer_cost_us(CacheTier::Hbm, 4 * 1024 * 1024, true, true)
                 < cost.prefill_cost_us(64)
         );
+    }
+
+    #[test]
+    fn data_plane_reports_tier_and_fetch_cost() {
+        let key = KvBlockKey::new("m", "t", "ten", "p", "b", 0, 64);
+        // No data plane: knows nothing (QuillCache infers from events instead).
+        assert_eq!(NoDataPlane.name(), "none");
+        assert_eq!(NoDataPlane.tier_of("w0", &key), None);
+        assert_eq!(NoDataPlane.fetch_cost_us("w0", &key), None);
+
+        // Mock data plane: records tiers and derives a fetch cost.
+        let mut dp = MockDataPlane::new();
+        assert_eq!(dp.name(), "mock");
+        assert_eq!(dp.tier_of("w0", &key), None);
+        dp.place("w0", key.clone(), CacheTier::LocalSsd);
+        assert_eq!(dp.tier_of("w0", &key), Some(CacheTier::LocalSsd));
+        assert!(dp.fetch_cost_us("w0", &key).unwrap() > 0);
+        // A block placed nowhere is still unknown.
+        assert_eq!(dp.tier_of("w1", &key), None);
     }
 
     fn mem_scope() -> IdentityScope {

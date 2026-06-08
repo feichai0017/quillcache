@@ -254,6 +254,8 @@ async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse 
         "engines": control.engines(),
         "workers": control.workers(),
         "index": control.residency().metrics(),
+        "index_backend": control.residency().name(),
+        "data_plane": control.data_plane().name(),
         "resident_blocks": control.residency().len(),
         "residency": control.residency().snapshot(),
     }))

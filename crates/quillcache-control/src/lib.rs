@@ -1,7 +1,7 @@
 use quillcache_core::{
-    BlockRemovedEvent, BlockStoredEvent, CacheResidency, CacheTier, EngineEndpoint,
+    BlockRemovedEvent, BlockStoredEvent, CacheResidency, CacheTier, DataPlane, EngineEndpoint,
     ExternalKvBlockKey, IdentityScope, IndexBackend, KvBlockKey, KvEvent, KvEventBatch,
-    MemoryIndex, RequestShape, ReuseViolation, WorkerState,
+    MemoryIndex, NoDataPlane, RequestShape, ReuseViolation, WorkerState,
 };
 use quillcache_router::{GreedyStatePlaneRouter, RouteDecision, RouterError, RoutingPolicy};
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,7 @@ pub struct ControlPlane {
     workers: Vec<WorkerState>,
     router: Box<dyn RoutingPolicy>,
     residency: Box<dyn IndexBackend>,
+    data_plane: Box<dyn DataPlane>,
 }
 
 impl ControlPlane {
@@ -213,7 +214,20 @@ impl ControlPlane {
             workers,
             router,
             residency,
+            data_plane: Box::new(NoDataPlane),
         }
+    }
+
+    /// Attach a KV-tensor data plane (LMCache / KVBM / FlexKV adapter). By default
+    /// there is none and QuillCache infers residency from routing + KV events;
+    /// this is the seam where a real tensor store plugs in under the control plane.
+    pub fn with_data_plane(mut self, data_plane: Box<dyn DataPlane>) -> Self {
+        self.data_plane = data_plane;
+        self
+    }
+
+    pub fn data_plane(&self) -> &dyn DataPlane {
+        self.data_plane.as_ref()
     }
 
     pub fn route(&self, request: &RequestShape) -> Result<RouteDecision, ControlError> {
@@ -591,5 +605,16 @@ mod tests {
         let control = ControlPlane::with_index(vec![engine()], Box::new(MemoryIndex::new()));
         assert_eq!(control.residency().name(), "memory");
         assert!(!control.residency().persistent());
+    }
+
+    #[test]
+    fn control_plane_data_plane_defaults_to_none_and_is_pluggable() {
+        use quillcache_core::MockDataPlane;
+        let control = ControlPlane::new(vec![engine()]);
+        // By default there is no tensor data plane (infer from events).
+        assert_eq!(control.data_plane().name(), "none");
+        // A data plane (LMCache/KVBM/FlexKV adapter) plugs in at this seam.
+        let control = control.with_data_plane(Box::new(MockDataPlane::new()));
+        assert_eq!(control.data_plane().name(), "mock");
     }
 }
