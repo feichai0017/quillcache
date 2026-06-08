@@ -180,6 +180,7 @@ fn synthetic_request(request_idx: u32, config: SyntheticWorkloadConfig) -> Reque
         tokenizer_id: "llama-tokenizer".to_string(),
         adapter_id: None,
         tenant_id: "tenant-a".to_string(),
+        session_id: None,
         blocks,
         estimated_decode_tokens: 128,
         slo: SloTarget::default(),

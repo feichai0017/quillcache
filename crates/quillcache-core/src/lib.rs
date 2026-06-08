@@ -322,6 +322,10 @@ pub struct RequestShape {
     pub tokenizer_id: String,
     pub adapter_id: Option<String>,
     pub tenant_id: String,
+    /// Conversation/agent session this request belongs to, when known. Multi-turn
+    /// and agentic workloads reuse a growing prefix, so a session-aware policy
+    /// keeps a session's turns on the engine accumulating its KV.
+    pub session_id: Option<String>,
     pub blocks: Vec<KvBlockKey>,
     pub estimated_decode_tokens: u32,
     pub slo: SloTarget,

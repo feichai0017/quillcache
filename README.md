@@ -73,7 +73,7 @@ mode runs one chosen combination in front of real engines.
 | Axis | Trait / type | Available | Planned |
 | --- | --- | --- | --- |
 | Inference engine / connector | `EngineEndpoint` + KV events | vLLM (OpenAI-compatible + KV events) | SGLang, LMCache events |
-| Routing policy | `quillcache_core` → `quillcache_router::RoutingPolicy` | `LeastLoadedRouter` (baseline), `GreedyStatePlaneRouter` (cache-aware), `PrefixAffinityRouter`, `RoundRobinRouter`, **`SloAwareRouter`** (SLO as a near-hard constraint, session-affine within it) | session/DAG-aware |
+| Routing policy | `quillcache_core` → `quillcache_router::RoutingPolicy` | `LeastLoadedRouter` (baseline), `GreedyStatePlaneRouter` (cache-aware), `PrefixAffinityRouter`, `RoundRobinRouter`, **`SloAwareRouter`** (SLO as a near-hard constraint), **`SessionAffinityRouter`** (pin a session/DAG to its engine) | network-aware |
 | Index backend | `quillcache_core::IndexBackend` | `MemoryIndex` (reference), **Holt** (ART), **RocksDB** (LSM) | filesystem |
 
 ## Two "KV"s, two "backends" (read this first)
@@ -269,7 +269,7 @@ exact block hashes while keeping the upstream request clean. See
 - ✅ **Closed online residency loop**: the gateway records inferred placement from its own routing decisions and derives prefix blocks from the prompt, so cache-aware routing works end-to-end without a KV-events bridge (verified live: a 2nd request sharing a system prompt routes to the same engine with a real local hit). KV events (Tier 2) upgrade inferred residency to ground truth.
 - ✅ Vendor-neutral `/v1/kv-events` ingest (vLLM BlockStored / BlockRemoved / AllBlocksCleared shape).
 - ✅ Single `IndexBackend` seam with an in-memory reference backend + identity-aware prefix scan.
-- ✅ Pluggable `RoutingPolicy`: load-only baseline, cache-aware greedy, prefix-affinity, round-robin, and SLO-aware (SLO as a near-hard constraint, session-affine within it).
+- ✅ Pluggable `RoutingPolicy`: load-only baseline, cache-aware greedy, prefix-affinity, round-robin, SLO-aware (SLO as a near-hard constraint), and session-affine (pin a multi-turn/agent session to the engine accumulating its KV).
 - ✅ Experiment harness comparing policies × backends on one trace.
 - ✅ Holt (ART) and RocksDB (LSM) index backends + `bench-index` ART-vs-LSM comparison.
 - ✅ Eviction-churn benchmark + O(matches) `remove_block` via a secondary block_hash index (100–300× faster eviction on the persistent backends).
@@ -280,7 +280,7 @@ exact block hashes while keeping the upstream request clean. See
 ## Roadmap
 
 1. ✅ Holt (ART) + RocksDB (LSM) `IndexBackend`s + ART-vs-LSM benchmark + eviction churn (O(matches) `remove_block`) — done; next: true write-amplification, Holt compaction/on-disk, larger traces.
-2. ✅ SLO-aware routing (`SloAwareRouter`: SLO as a near-hard constraint, keeps a session local until load threatens the SLO, then spills) — done; next: session/DAG-aware policies.
+2. ✅ SLO-aware routing (`SloAwareRouter`) and session/DAG-affine routing (`SessionAffinityRouter`: pin a session to the engine accumulating its KV) — done; next: network-aware placement.
 3. ✅ Real vLLM KV-event connector end-to-end (inferred placement + Tier-2 `/v1/kv-events` correction) — done; next: SGLang connector, chat / RAG / agent traces.
 4. Tiered placement and eviction across HBM / DRAM / SSD / remote.
 5. ✅ Identity-governed safe reuse: refuse unsafe reuse and quantify its cost (`safe-reuse`) — done; next: enforce it inline in the gateway and add cross-model/tokenizer/quant axes.

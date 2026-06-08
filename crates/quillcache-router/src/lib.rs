@@ -436,6 +436,87 @@ impl RoutingPolicy for SloAwareRouter {
     }
 }
 
+/// Session/DAG-affine policy for multi-turn and agentic workloads, where a
+/// session reuses a *growing* prefix and rebuilding its context is expensive.
+/// It prioritizes **session locality above load**: follow the session's KV to
+/// whichever engine already holds the most of it (most local hits); on a cold
+/// session, pin it to a deterministic home engine by hashing the `session_id`
+/// (or the conversation root prefix). With the closed residency loop, turn 1
+/// pins the session and writes its blocks home, and every later turn finds them
+/// resident there and sticks — the whole session's KV accumulates on one engine.
+///
+/// Unlike [`SloAwareRouter`] (which spills a session off its engine under SLO
+/// pressure) or [`GreedyStatePlaneRouter`] (which scatters by latency), this
+/// keeps a session pinned, trading per-request load balance for maximal context
+/// reuse — the right call when recomputing a long agent history dominates.
+#[derive(Debug, Clone, Default)]
+pub struct SessionAffinityRouter {
+    cost_model: CostModel,
+}
+
+impl SessionAffinityRouter {
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+}
+
+impl RoutingPolicy for SessionAffinityRouter {
+    fn name(&self) -> &str {
+        "session-affinity"
+    }
+
+    fn route(
+        &self,
+        request: &RequestShape,
+        workers: &[WorkerState],
+        residency: &[CacheResidency],
+    ) -> Result<RouteDecision, RouterError> {
+        if workers.is_empty() {
+            return Err(RouterError::NoWorkers);
+        }
+        let worker_by_id: HashMap<&str, &WorkerState> = workers
+            .iter()
+            .map(|worker| (worker.id.as_str(), worker))
+            .collect();
+
+        // Warm session: follow its KV to the engine holding the most of it.
+        let warmest = workers
+            .iter()
+            .map(|worker| {
+                plan_for_worker(&self.cost_model, request, worker, &worker_by_id, residency)
+            })
+            .max_by_key(|decision| decision.local_hits.len());
+        if let Some(decision) = warmest {
+            if !decision.local_hits.is_empty() {
+                return Ok(decision);
+            }
+        }
+
+        // Cold session: pin to a deterministic home by session id (or the
+        // conversation root prefix), so all of its turns land together.
+        let key = request
+            .session_id
+            .as_deref()
+            .or_else(|| {
+                request
+                    .blocks
+                    .first()
+                    .map(|block| block.prefix_hash.as_str())
+            })
+            .unwrap_or(request.id.as_str());
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let idx = (hasher.finish() % workers.len() as u64) as usize;
+        Ok(plan_for_worker(
+            &self.cost_model,
+            request,
+            &workers[idx],
+            &worker_by_id,
+            residency,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +530,7 @@ mod tests {
             tokenizer_id: "tok".to_string(),
             adapter_id: None,
             tenant_id: "tenant-a".to_string(),
+            session_id: None,
             blocks: vec![block],
             estimated_decode_tokens: 32,
             slo: SloTarget::default(),
@@ -587,5 +669,38 @@ mod tests {
             .unwrap();
         assert_eq!(decision.worker_id, "w0");
         assert!(decision.recomputes.len() == 1 || !decision.transfers.is_empty());
+    }
+
+    #[test]
+    fn session_affinity_pins_cold_then_follows_warm() {
+        let workers = vec![
+            WorkerState::new("w0", "rack-a"),
+            WorkerState::new("w1", "rack-a"),
+        ];
+        let router = SessionAffinityRouter::default();
+
+        // Cold session: pinned to a deterministic home by session id, and every
+        // turn of the same session lands there (no residency yet).
+        let mut turn1 = request_with_shared_block();
+        turn1.session_id = Some("session-42".to_string());
+        let home = router.route(&turn1, &workers, &[]).unwrap().worker_id;
+        let mut turn1b = turn1.clone();
+        turn1b.id = "req-1b".to_string();
+        assert_eq!(
+            router.route(&turn1b, &workers, &[]).unwrap().worker_id,
+            home
+        );
+
+        // Warm: the session's KV is now resident on the *other* engine — session
+        // affinity follows the KV there, even against the cold hash home.
+        let other = if home == "w0" { "w1" } else { "w0" };
+        let residency = vec![CacheResidency::hbm(
+            other,
+            turn1.blocks[0].clone(),
+            4 * 1024 * 1024,
+        )];
+        let decision = router.route(&turn1, &workers, &residency).unwrap();
+        assert_eq!(decision.worker_id, other);
+        assert_eq!(decision.local_hits.len(), 1);
     }
 }

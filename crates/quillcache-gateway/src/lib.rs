@@ -11,7 +11,7 @@ use quillcache_core::{
 };
 use quillcache_router::{
     GreedyStatePlaneRouter, LeastLoadedRouter, PrefixAffinityRouter, RoundRobinRouter,
-    RoutingPolicy, SloAwareRouter,
+    RoutingPolicy, SessionAffinityRouter, SloAwareRouter,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,7 @@ fn build_policy(name: Option<&str>) -> Box<dyn RoutingPolicy> {
         "round-robin" | "roundrobin" => Box::new(RoundRobinRouter::default()),
         "least-loaded" | "load" => Box::new(LeastLoadedRouter::default()),
         "slo-aware" | "slo" => Box::new(SloAwareRouter::default()),
+        "session-affinity" | "session" => Box::new(SessionAffinityRouter::default()),
         _ => Box::new(GreedyStatePlaneRouter::default()),
     }
 }
@@ -337,6 +338,7 @@ fn request_shape_from_payload(payload: &mut Value) -> RequestShape {
         .as_ref()
         .and_then(|hints| hints.request_id.clone())
         .unwrap_or_else(fallback_request_id);
+    let session_id = hints.as_ref().and_then(|hints| hints.session_id.clone());
 
     let blocks = hints
         .as_ref()
@@ -350,6 +352,7 @@ fn request_shape_from_payload(payload: &mut Value) -> RequestShape {
         tokenizer_id,
         adapter_id: hints.and_then(|hints| hints.adapter_id),
         tenant_id,
+        session_id,
         blocks,
         estimated_decode_tokens,
         slo: SloTarget::default(),
