@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use quillcache_core::MemoryIndex;
 use quillcache_gateway::run_from_config_path;
 use quillcache_sim::{
-    bench_index, run_safe_reuse, run_synthetic, IndexBenchConfig, SafeReuseConfig,
-    SyntheticWorkloadConfig,
+    bench_index, run_safe_reuse, run_synthetic, run_tiered, IndexBenchConfig, SafeReuseConfig,
+    SyntheticWorkloadConfig, TieredConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -58,6 +58,26 @@ enum Command {
         scan_queries: u32,
         #[arg(long, default_value_t = 0)]
         churn_ops: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tiered KV block management (KVBM-style): HBM/DRAM/SSD with promotion and
+    /// eviction, vs an HBM-only baseline on the same trace.
+    Tiered {
+        #[arg(long, default_value_t = 4000)]
+        blocks: u32,
+        #[arg(long, default_value_t = 40000)]
+        accesses: u32,
+        #[arg(long, default_value_t = 200)]
+        hbm: u32,
+        #[arg(long, default_value_t = 800)]
+        dram: u32,
+        #[arg(long, default_value_t = 4000)]
+        ssd: u32,
+        #[arg(long, default_value_t = 10)]
+        hot_percent: u32,
+        #[arg(long, default_value_t = 256)]
+        block_tokens: u32,
         #[arg(long)]
         json: bool,
     },
@@ -192,6 +212,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ms) = report.recovery_ms {
                     println!("recovery (reopen from disk): {:.2} ms", ms);
                 }
+            }
+        }
+        Command::Tiered {
+            blocks,
+            accesses,
+            hbm,
+            dram,
+            ssd,
+            hot_percent,
+            block_tokens,
+            json,
+        } => {
+            let report = run_tiered(TieredConfig {
+                blocks,
+                accesses,
+                hbm_blocks: hbm,
+                dram_blocks: dram,
+                ssd_blocks: ssd,
+                hot_percent,
+                block_tokens,
+                block_bytes: 2 * 1024 * 1024,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let total = report.accesses.max(1) as f64;
+                let hit = |n: u64| 100.0 * n as f64 / total;
+                println!("QuillCache tiered KV block management (KVBM-style)");
+                println!(
+                    "tiers: HBM {} · DRAM {} · SSD {} blocks (effective cache {})",
+                    hbm, dram, ssd, report.effective_cache_blocks
+                );
+                println!("accesses: {}", report.accesses);
+                println!(
+                    "hits: HBM {} ({:.1}%) · DRAM {} ({:.1}%) · SSD {} ({:.1}%) · miss {} ({:.1}%)",
+                    report.hbm_hits,
+                    hit(report.hbm_hits),
+                    report.dram_hits,
+                    hit(report.dram_hits),
+                    report.ssd_hits,
+                    hit(report.ssd_hits),
+                    report.misses,
+                    hit(report.misses)
+                );
+                println!(
+                    "movement: {} promotions · {} demotions · {} evictions",
+                    report.promotions, report.demotions, report.evictions
+                );
+                println!(
+                    "vs HBM-only: {} misses → {} ({} recomputes avoided)",
+                    report.hbm_only_misses, report.misses, report.recomputes_avoided
+                );
+                println!(
+                    "cost: {:.1} ms vs HBM-only {:.1} ms → {:.1}% saved",
+                    report.total_cost_ms, report.hbm_only_cost_ms, report.cost_saved_pct
+                );
             }
         }
         Command::SafeReuse {

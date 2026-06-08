@@ -12,6 +12,9 @@ pub use index_bench::{bench_index, IndexBenchConfig, IndexBenchReport};
 pub mod safe_reuse;
 pub use safe_reuse::{run_safe_reuse, SafeReuseConfig, SafeReuseReport};
 
+pub mod tiered;
+pub use tiered::{run_tiered, TieredConfig, TieredReport};
+
 #[derive(Debug, Error)]
 pub enum SimError {
     #[error(transparent)]

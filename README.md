@@ -213,7 +213,7 @@ fix.
 
 | Package | Role |
 | --- | --- |
-| `quillcache` | CLI: `simulate`, `bench-index`, `safe-reuse`, `plan`, `gateway`. |
+| `quillcache` | CLI: `simulate`, `bench-index`, `safe-reuse`, `tiered`, `plan`, `gateway`. |
 | `quillcache-core` | `KvBlockKey` identity, `CacheResidency`, cost model, and the `IndexBackend` trait + `MemoryIndex` reference backend. |
 | `quillcache-router` | `RoutingPolicy` trait; `GreedyStatePlaneRouter` (cache-aware) and `LeastLoadedRouter` (baseline). |
 | `quillcache-control` | `ControlPlane` and the backend-agnostic `ingest_batch` (KV events → residency). |
@@ -239,6 +239,9 @@ cargo run --features "rocksdb holt" -- bench-index --backend holt
 # Identity-governed safe reuse: naive content-hash reuse vs the identity guard.
 cargo run -- safe-reuse
 cargo run -- safe-reuse --tenants 32 --adapters 0   # privacy-heavy mix
+
+# Tiered KV block management (KVBM-style HBM/DRAM/SSD) vs an HBM-only baseline.
+cargo run -- tiered
 
 # Print the research plan / build order.
 cargo run -- plan
@@ -277,6 +280,7 @@ exact block hashes while keeping the upstream request clean. See
 - ✅ Single `IndexBackend` seam with an in-memory reference backend + identity-aware prefix scan.
 - ✅ **Persistent residency index in the online gateway** (`index: holt` / `rocksdb`): the control plane can be backed by Holt (persistent ART), so fleet residency **survives a gateway restart** — verified live (2 blocks placed → SIGTERM flush → reopen → 2 blocks recovered, no replay of events).
 - ✅ Mixed **engine fleet** behind one control plane (vLLM + SGLang, both OpenAI-compatible — see `examples/quillcache-mixed-fleet.yaml`) and a **`DataPlane` seam** where a KV-tensor store (LMCache / Dynamo KVBM / FlexKV) plugs in under the control plane (`NoDataPlane` default, `MockDataPlane` for tests).
+- ✅ **Tiered KV block management** (`quillcache tiered`) — a KVBM-style HBM→DRAM→SSD cache with promotion / demotion / eviction vs an HBM-only baseline. On a skewed trace it turns ~13k recomputes into cheap tier-hits and cuts total prefill cost **~76%** (HBM 59% / DRAM 22% / SSD 10% hits, 9% miss).
 - ✅ Pluggable `RoutingPolicy`: load-only baseline, cache-aware greedy, prefix-affinity, round-robin, SLO-aware (SLO as a near-hard constraint), and session-affine (pin a multi-turn/agent session to the engine accumulating its KV).
 - ✅ Experiment harness comparing policies × backends on one trace.
 - ✅ Holt (ART) and RocksDB (LSM) index backends + `bench-index` ART-vs-LSM comparison.
@@ -290,7 +294,7 @@ exact block hashes while keeping the upstream request clean. See
 1. ✅ Holt (ART) + RocksDB (LSM) `IndexBackend`s + ART-vs-LSM benchmark + eviction churn (O(matches) `remove_block`) — done; next: true write-amplification, Holt compaction/on-disk, larger traces.
 2. ✅ SLO-aware routing (`SloAwareRouter`) and session/DAG-affine routing (`SessionAffinityRouter`: pin a session to the engine accumulating its KV) — done; next: network-aware placement.
 3. ✅ Real vLLM KV-event connector end-to-end (inferred placement + Tier-2 `/v1/kv-events` correction) — done; next: SGLang connector, chat / RAG / agent traces.
-4. Tiered placement and eviction across HBM / DRAM / SSD / remote.
+4. ✅ Tiered placement and eviction across HBM / DRAM / SSD (`tiered`, KVBM-style) — done; next: remote tier, tier-aware routing in the online path.
 5. ✅ Identity-governed safe reuse: refuse unsafe reuse and quantify its cost (`safe-reuse`) — done; next: enforce it inline in the gateway and add cross-model/tokenizer/quant axes.
 6. Baselines: engine-local prefix caching, LMCache-style cache, Mooncake-style pool.
 
