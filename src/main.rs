@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
+use quillcache_core::MemoryIndex;
 use quillcache_gateway::run_from_config_path;
-use quillcache_sim::{run_synthetic, SyntheticWorkloadConfig};
+use quillcache_sim::{bench_index, run_synthetic, IndexBenchConfig, SyntheticWorkloadConfig};
 
 #[derive(Debug, Parser)]
 #[command(name = "quillcache")]
@@ -33,6 +34,25 @@ enum Command {
         block_tokens: u32,
         #[arg(long, default_value_t = 4 * 1024 * 1024)]
         block_bytes: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Benchmark an index backend: ingest throughput and prefix-scan latency.
+    BenchIndex {
+        #[arg(long, default_value = "memory")]
+        backend: String,
+        #[arg(long, default_value_t = 2000)]
+        requests: u32,
+        #[arg(long, default_value_t = 16)]
+        shared_prefix_blocks: u32,
+        #[arg(long, default_value_t = 4)]
+        unique_blocks: u32,
+        #[arg(long, default_value_t = 64)]
+        block_tokens: u32,
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        block_bytes: u64,
+        #[arg(long, default_value_t = 20000)]
+        scan_queries: u32,
         #[arg(long)]
         json: bool,
     },
@@ -79,6 +99,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("transfer blocks: {}", report.transfer_blocks);
                 println!("recompute blocks: {}", report.recompute_blocks);
                 println!("avg estimated TTFT: {:.2} ms", report.avg_estimated_ttft_ms);
+            }
+        }
+        Command::BenchIndex {
+            backend,
+            requests,
+            shared_prefix_blocks,
+            unique_blocks,
+            block_tokens,
+            block_bytes,
+            scan_queries,
+            json,
+        } => {
+            let config = IndexBenchConfig {
+                requests,
+                shared_prefix_blocks,
+                unique_blocks_per_request: unique_blocks,
+                block_tokens,
+                block_bytes,
+                scan_queries,
+            };
+            let report = match backend.as_str() {
+                "memory" => bench_index(&mut MemoryIndex::new(), config),
+                other => {
+                    return Err(format!(
+                        "unknown index backend '{other}' (available: memory; rocksdb/holt land in M1b/M2)"
+                    )
+                    .into())
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("QuillCache index benchmark — backend: {}", report.backend);
+                println!("persistent: {}", report.persistent);
+                println!("blocks ingested: {}", report.blocks_ingested);
+                println!(
+                    "ingest: {:.0} puts/sec ({:.3}s)",
+                    report.ingest_puts_per_sec, report.ingest_secs
+                );
+                println!(
+                    "prefix_scan: p50 {:.2} us · p99 {:.2} us · mean {:.2} us ({} queries)",
+                    report.scan_p50_us,
+                    report.scan_p99_us,
+                    report.scan_mean_us,
+                    report.scan_queries
+                );
+                println!(
+                    "resident blocks: {} · bytes_written: {}",
+                    report.metrics.resident_blocks, report.metrics.bytes_written
+                );
             }
         }
     }

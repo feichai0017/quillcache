@@ -6,6 +6,9 @@ use quillcache_router::{GreedyStatePlaneRouter, RouterError, RoutingPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod index_bench;
+pub use index_bench::{bench_index, IndexBenchConfig, IndexBenchReport};
+
 #[derive(Debug, Error)]
 pub enum SimError {
     #[error(transparent)]

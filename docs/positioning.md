@@ -39,6 +39,22 @@ identity-aware, persistent, and policy-driven KV cache reuse in LLM serving.
 - It does not move KV tensor bytes in v0.1.
 - It does not claim production-grade multi-tenant isolation yet.
 
+## Precisely: what "interface with real KV cache" means
+
+QuillCache taps the **state** of real engines' KV cache (which block is cached
+where, via their KV events), runs **different routing / reuse policies** on it,
+and is **engine-neutral** (vLLM / SGLang). It does not touch the KV tensor
+**bytes**.
+
+- **Reads (today):** ingest engine KV events → real, live residency state.
+- **Writes (later):** instruct the engine / LMCache to reuse or load a block
+  (e.g. via vLLM `kv_transfer`); QuillCache *orchestrates* the data plane, it
+  does not move tensors itself.
+
+Three pluggable axes: **engines** (vLLM / SGLang), **routing policies**
+(`RoutingPolicy`), and **index storage engines** (`IndexBackend`:
+memory / Holt-ART / RocksDB-LSM).
+
 ## Research Bet
 
 The research bet is that performance-oriented KV-cache systems and
