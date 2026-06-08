@@ -213,7 +213,7 @@ fix.
 
 | Package | Role |
 | --- | --- |
-| `quillcache` | CLI: `simulate`, `bench-index`, `safe-reuse`, `tiered`, `plan`, `gateway`. |
+| `quillcache` | CLI: `simulate`, `bench-index`, `safe-reuse`, `tiered`, `disagg`, `plan`, `gateway`. |
 | `quillcache-core` | `KvBlockKey` identity, `CacheResidency`, cost model, and the `IndexBackend` trait + `MemoryIndex` reference backend. |
 | `quillcache-router` | `RoutingPolicy` trait; `GreedyStatePlaneRouter` (cache-aware) and `LeastLoadedRouter` (baseline). |
 | `quillcache-control` | `ControlPlane` and the backend-agnostic `ingest_batch` (KV events → residency). |
@@ -242,6 +242,8 @@ cargo run -- safe-reuse --tenants 32 --adapters 0   # privacy-heavy mix
 
 # Tiered KV block management (KVBM-style HBM/DRAM/SSD) vs an HBM-only baseline.
 cargo run -- tiered
+# Prefill/decode disaggregation (Dynamo/llm-d topology): TTFT under load.
+cargo run -- disagg --load-percent 90
 
 # Print the research plan / build order.
 cargo run -- plan
@@ -281,6 +283,7 @@ exact block hashes while keeping the upstream request clean. See
 - ✅ **Persistent residency index in the online gateway** (`index: holt` / `rocksdb`): the control plane can be backed by Holt (persistent ART), so fleet residency **survives a gateway restart** — verified live (2 blocks placed → SIGTERM flush → reopen → 2 blocks recovered, no replay of events).
 - ✅ Mixed **engine fleet** behind one control plane (vLLM + SGLang, both OpenAI-compatible — see `examples/quillcache-mixed-fleet.yaml`) and a **`DataPlane` seam** where a KV-tensor store (LMCache / Dynamo KVBM / FlexKV) plugs in under the control plane (`NoDataPlane` default, `MockDataPlane` for tests).
 - ✅ **Tiered KV block management** (`quillcache tiered`) — a KVBM-style HBM→DRAM→SSD cache with promotion / demotion / eviction vs an HBM-only baseline. On a skewed trace it turns ~13k recomputes into cheap tier-hits and cuts total prefill cost **~76%** (HBM 59% / DRAM 22% / SSD 10% hits, 9% miss).
+- ✅ **Prefill/decode disaggregation** (`quillcache disagg`) — a discrete-event TTFT sim of the Dynamo/llm-d topology (aggregated prefill+decode per engine vs a prefill pool + decode pool, Poisson arrivals). Disaggregation cuts p99 TTFT **24% @ 75% load, 41% @ 90%** (prefill no longer queues behind long decodes); the gain grows with load.
 - ✅ Pluggable `RoutingPolicy`: load-only baseline, cache-aware greedy, prefix-affinity, round-robin, SLO-aware (SLO as a near-hard constraint), and session-affine (pin a multi-turn/agent session to the engine accumulating its KV).
 - ✅ Experiment harness comparing policies × backends on one trace.
 - ✅ Holt (ART) and RocksDB (LSM) index backends + `bench-index` ART-vs-LSM comparison.

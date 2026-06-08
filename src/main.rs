@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use quillcache_core::MemoryIndex;
 use quillcache_gateway::run_from_config_path;
 use quillcache_sim::{
-    bench_index, run_safe_reuse, run_synthetic, run_tiered, IndexBenchConfig, SafeReuseConfig,
-    SyntheticWorkloadConfig, TieredConfig,
+    bench_index, run_disagg, run_safe_reuse, run_synthetic, run_tiered, DisaggConfig,
+    IndexBenchConfig, SafeReuseConfig, SyntheticWorkloadConfig, TieredConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -78,6 +78,24 @@ enum Command {
         hot_percent: u32,
         #[arg(long, default_value_t = 256)]
         block_tokens: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prefill/decode disaggregation (Dynamo/llm-d topology): TTFT under a burst,
+    /// aggregated (prefill+decode per engine) vs disaggregated (separate pools).
+    Disagg {
+        #[arg(long, default_value_t = 2000)]
+        requests: u32,
+        #[arg(long, default_value_t = 8)]
+        engines: u32,
+        #[arg(long, default_value_t = 512)]
+        prefill_tokens: u32,
+        #[arg(long, default_value_t = 1024)]
+        decode_tokens: u32,
+        #[arg(long, default_value_t = 0)]
+        prefill_engines: u32,
+        #[arg(long, default_value_t = 75)]
+        load_percent: u32,
         #[arg(long)]
         json: bool,
     },
@@ -267,6 +285,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "cost: {:.1} ms vs HBM-only {:.1} ms → {:.1}% saved",
                     report.total_cost_ms, report.hbm_only_cost_ms, report.cost_saved_pct
+                );
+            }
+        }
+        Command::Disagg {
+            requests,
+            engines,
+            prefill_tokens,
+            decode_tokens,
+            prefill_engines,
+            load_percent,
+            json,
+        } => {
+            let report = run_disagg(DisaggConfig {
+                requests,
+                engines,
+                prefill_tokens,
+                decode_tokens,
+                prefill_engines,
+                load_percent,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("QuillCache prefill/decode disaggregation");
+                println!(
+                    "{} reqs · {} engines · prefill {:.1} ms · decode {:.1} ms/req · {}% load",
+                    report.requests,
+                    report.engines,
+                    report.prefill_ms,
+                    report.decode_ms,
+                    report.load_percent
+                );
+                println!(
+                    "aggregated  (prefill+decode/engine): TTFT p50 {:.0} · p99 {:.0} ms",
+                    report.agg_ttft_p50_ms, report.agg_ttft_p99_ms
+                );
+                println!(
+                    "disaggregated ({}P + {}D pools):       TTFT p50 {:.0} · p99 {:.0} ms",
+                    report.disagg_prefill_engines,
+                    report.disagg_decode_engines,
+                    report.disagg_ttft_p50_ms,
+                    report.disagg_ttft_p99_ms
+                );
+                println!(
+                    "=> disaggregation cuts p99 TTFT by {:.1}% (prefill no longer waits behind decode)",
+                    report.ttft_p99_reduction_pct
                 );
             }
         }

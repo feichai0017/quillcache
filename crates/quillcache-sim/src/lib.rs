@@ -15,6 +15,9 @@ pub use safe_reuse::{run_safe_reuse, SafeReuseConfig, SafeReuseReport};
 pub mod tiered;
 pub use tiered::{run_tiered, TieredConfig, TieredReport};
 
+pub mod disagg;
+pub use disagg::{run_disagg, DisaggConfig, DisaggReport};
+
 #[derive(Debug, Error)]
 pub enum SimError {
     #[error(transparent)]
