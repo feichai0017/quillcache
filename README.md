@@ -86,6 +86,28 @@ mode runs one chosen combination in front of real engines.
 | Runtime data plane | `quillcache_core::DataPlane` | `NoDataPlane`, **`TieredDataPlane`** (HBM/DRAM/SSD admission, promotion, demotion, eviction) | LMCache/KVBM/FlexKV adapters |
 | Execution adapter | gateway `action_sink` | HTTP action events + local mock sink | vLLM `kv_transfer`, SGLang/LMCache, Dynamo KVBM bridge |
 
+## Measured vs modeled (read this before the numbers)
+
+Honesty matters more than big numbers. Two kinds of results live in this repo:
+
+- **Measured** — real code, real engines, real measurements:
+  - the **ART-vs-LSM storage study** (`bench-index`): prefix-scan latency,
+    recovery, on-disk size, and **write amplification** (from RocksDB's own
+    statistics) — these run real Holt / RocksDB engines.
+  - the **live demos**: cache-affine routing across **2 real vLLM** on Modal L4
+    (P99 TTFT 81 s → 4.3 s — *real, though the round-robin tail was amplified by
+    Modal scale-to-zero cold starts*), persistent residency surviving a restart,
+    the identity guard refusing cross-tenant reuse inline, and the inferred→precise
+    KV-event correction.
+- **Modeled** — cost-model simulations, illustrative of a mechanism, **not** run
+  on real GPUs: the `tiered` (KVBM-style, ~76% cost cut), `disagg` (PD TTFT,
+  24–52%), and `simulate` experiments use an uncalibrated cost model. They show
+  *how* a mechanism behaves and are labeled as models, not hardware results.
+
+The runtime control plane itself — gateway, planner, tiered data plane, action
+sink — is real code in the online path (see `docs/runtime-control-plane.md`); the
+*performance numbers* from the simulator are the modeled part.
+
 ## Two "KV"s, two "backends" (read this first)
 
 | | Stores | Size | Owner |
