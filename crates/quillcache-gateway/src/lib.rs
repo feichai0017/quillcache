@@ -9,12 +9,12 @@ use quillcache_control::{ControlPlane, IngestSummary, PlanAction, RequestPlan, S
 use quillcache_core::{
     DataPlane, DataPlaneAction, EngineEndpoint, ExternalKvBlockKey, IndexBackend, KvBlockKey,
     KvEventBatch, MemoryIndex, NoDataPlane, RequestKvHints, RequestShape, SloTarget,
-    TieredDataPlane, TieredDataPlaneConfig,
 };
 use quillcache_router::{
     DynamoCostRouter, GreedyStatePlaneRouter, LeastLoadedRouter, PrefixAffinityRouter,
     RoundRobinRouter, RoutingPolicy, SessionAffinityRouter, SloAwareRouter,
 };
+use quillcache_store::{StoreDataPlane, StoreTierConfig};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -475,9 +475,9 @@ fn build_data_plane(config: Option<&DataPlaneConfig>) -> Box<dyn DataPlane> {
     };
     match config.kind.as_str() {
         "none" => Box::new(NoDataPlane),
-        "tiered" => {
-            let defaults = TieredDataPlaneConfig::default();
-            Box::new(TieredDataPlane::new(TieredDataPlaneConfig {
+        "tiered" | "store" => {
+            let defaults = StoreTierConfig::default();
+            Box::new(StoreDataPlane::new(StoreTierConfig {
                 hbm_capacity_bytes: config
                     .hbm_capacity_bytes
                     .unwrap_or(defaults.hbm_capacity_bytes),
@@ -1078,7 +1078,8 @@ mod tests {
             local_ssd_capacity_bytes: Some(4096),
         };
         let data_plane = build_data_plane(Some(&config));
-        assert_eq!(data_plane.name(), "tiered");
+        // The "tiered" config kind now builds the real store data plane.
+        assert_eq!(data_plane.name(), "store");
         assert_eq!(data_plane.metrics().resident_blocks, 0);
     }
 

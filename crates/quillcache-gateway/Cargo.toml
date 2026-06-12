@@ -11,6 +11,7 @@ axum = { workspace = true }
 quillcache-control = { path = "../quillcache-control", version = "1.0.0-alpha.1" }
 quillcache-core = { path = "../quillcache-core", version = "1.0.0-alpha.1" }
 quillcache-router = { path = "../quillcache-router", version = "1.0.0-alpha.1" }
+quillcache-store = { path = "../quillcache-store", version = "1.0.0-alpha.1" }
 quillcache-index-holt = { path = "../quillcache-index-holt", version = "1.0.0-alpha.1", optional = true }
 quillcache-index-rocksdb = { path = "../quillcache-index-rocksdb", version = "1.0.0-alpha.1", optional = true }
 futures-util = "0.3"

@@ -5,7 +5,8 @@ members = [
     "crates/quillcache-core",
     "crates/quillcache-gateway",
     "crates/quillcache-router",
-    "crates/quillcache-sim",
+    "crates/quillcache-store",
+    "crates/quillcache-transfer",
     "crates/quillcache-index-rocksdb",
     "crates/quillcache-index-holt",
 ]
@@ -15,9 +16,14 @@ default-members = [
     "crates/quillcache-core",
     "crates/quillcache-gateway",
     "crates/quillcache-router",
-    "crates/quillcache-sim",
+    "crates/quillcache-store",
+    "crates/quillcache-transfer",
     "crates/quillcache-index-holt",
 ]
+# The CUDA device tier is excluded so the default build never resolves/compiles
+# cudarc on a machine with no NVIDIA GPU. Build it standalone on a GPU box:
+#   cd crates/quillcache-cuda && cargo build --features cuda
+exclude = ["crates/quillcache-cuda"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -48,7 +54,6 @@ clap = { workspace = true }
 quillcache-core = { version = "1.0.0-alpha.1", path = "crates/quillcache-core" }
 quillcache-gateway = { version = "1.0.0-alpha.1", path = "crates/quillcache-gateway" }
 quillcache-router = { version = "1.0.0-alpha.1", path = "crates/quillcache-router" }
-quillcache-sim = { version = "1.0.0-alpha.1", path = "crates/quillcache-sim" }
 quillcache-index-rocksdb = { version = "1.0.0-alpha.1", path = "crates/quillcache-index-rocksdb", optional = true }
 quillcache-index-holt = { version = "1.0.0-alpha.1", path = "crates/quillcache-index-holt", optional = true }
 serde_json = { workspace = true }

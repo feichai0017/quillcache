@@ -62,6 +62,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1014,7 +1025,6 @@ dependencies = [
  "quillcache-index-holt",
  "quillcache-index-rocksdb",
  "quillcache-router",
- "quillcache-sim",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -1026,6 +1036,7 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "quillcache-core",
  "quillcache-router",
+ "quillcache-store",
  "serde",
  "thiserror",
 ]
@@ -1049,6 +1060,7 @@ dependencies = [
  "quillcache-index-holt",
  "quillcache-index-rocksdb",
  "quillcache-router",
+ "quillcache-store",
  "reqwest",
  "serde",
  "serde_json",
@@ -1087,13 +1099,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "quillcache-sim"
+name = "quillcache-store"
 version = "1.0.0-alpha.1"
 dependencies = [
+ "bytes",
+ "crc32fast",
  "quillcache-core",
- "quillcache-router",
+ "quillcache-transfer",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "quillcache-transfer"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "quillcache-core",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

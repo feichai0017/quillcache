@@ -1,0 +1,19 @@
+[package]
+name = "quillcache-store"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "Mooncake-style KV block store for QuillCache: real DRAM + SSD byte tiers, identity-guarded get, cross-node fetch"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+quillcache-core = { version = "1.0.0-alpha.1", path = "../quillcache-core" }
+quillcache-transfer = { version = "1.0.0-alpha.1", path = "../quillcache-transfer" }
+bytes = "1"
+crc32fast = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }

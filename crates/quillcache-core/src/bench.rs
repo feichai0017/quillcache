@@ -1,16 +1,20 @@
 //! Index-backend micro-benchmark — the rig behind the ART-vs-LSM study.
 //!
-//! Drives any [`IndexBackend`] with a KV-cache-shaped workload and measures the
-//! three operations that dominate a residency / prefix index:
+//! This is a real measurement harness, not a simulation: it drives an actual
+//! [`IndexBackend`] (memory / Holt-ART / RocksDB-LSM) with a KV-cache-shaped
+//! workload and times the three operations that dominate a residency / prefix
+//! index:
 //! - **ingest** (`put`, on KV `BlockStored` events),
-//! - **churn** (`remove_block` + `put`, simulating eviction + recompute under
+//! - **churn** (`remove_block` + `put`, the eviction + recompute path under
 //!   cache pressure — what a real KV-cache index sees once HBM fills),
 //! - **prefix lookup** (`prefix_scan`, on every request).
 //!
-//! Backend-agnostic, so memory / Holt (ART) / RocksDB (LSM) run the exact same
-//! workload for an apples-to-apples comparison.
+//! Backend-agnostic, so each engine runs the exact same workload for an
+//! apples-to-apples comparison. The workload is synthetic; the latencies,
+//! write-amplification, and recovery times measured against the real engines are
+//! not.
 
-use quillcache_core::{CacheResidency, IdentityScope, IndexBackend, IndexMetrics, KvBlockKey};
+use crate::{CacheResidency, IdentityScope, IndexBackend, IndexMetrics, KvBlockKey};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -235,7 +239,7 @@ fn summarize_us(samples_ns: &mut [u64]) -> (f64, f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quillcache_core::MemoryIndex;
+    use crate::MemoryIndex;
 
     #[test]
     fn bench_runs_against_memory_backend() {

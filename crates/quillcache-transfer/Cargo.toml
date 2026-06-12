@@ -1,0 +1,22 @@
+[package]
+name = "quillcache-transfer"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "Transfer-engine seam for QuillCache: move KV blocks between nodes (Local/TCP now, RDMA reserved)"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+quillcache-core = { version = "1.0.0-alpha.1", path = "../quillcache-core" }
+async-trait = "0.1"
+bytes = "1"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+
+[features]
+# RDMA backend (ibverbs). Reserved seam — stubbed until an RDMA NIC is available.
+rdma = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }
