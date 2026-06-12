@@ -192,7 +192,7 @@ fn bench_rocksdb(
     config: IndexBenchConfig,
 ) -> Result<quillcache_core::bench::IndexBenchReport, Box<dyn std::error::Error>> {
     use quillcache_core::IndexBackend;
-    use quillcache_index_rocksdb::RocksIndex;
+    use quillcache_core::RocksIndex;
 
     let dir = std::env::temp_dir().join(format!("quillcache-bench-rocksdb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -224,8 +224,8 @@ fn bench_rocksdb(
 fn bench_holt(
     config: IndexBenchConfig,
 ) -> Result<quillcache_core::bench::IndexBenchReport, Box<dyn std::error::Error>> {
+    use quillcache_core::HoltIndex;
     use quillcache_core::IndexBackend;
-    use quillcache_index_holt::HoltIndex;
 
     let dir = std::env::temp_dir().join(format!("quillcache-bench-holt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -9,3 +9,15 @@ repository = "https://github.com/feichai0017/quillcache"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Optional residency-index backends (feature-gated modules index_holt.rs /
+# index_rocksdb.rs — the ART-vs-LSM study). Off by default: `holt` is pure Rust;
+# `rocksdb` pulls a C++/libclang toolchain, so the default core build needs neither.
+serde_json = { workspace = true, optional = true }
+holt = { version = "0.5.4", optional = true }
+rocksdb = { version = "0.22", optional = true }
+
+[features]
+# Persistent ART (Holt) residency-index backend.
+holt = ["dep:holt", "dep:serde_json"]
+# LSM (RocksDB) residency-index backend.
+rocksdb = ["dep:rocksdb", "dep:serde_json"]

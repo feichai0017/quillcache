@@ -8,9 +8,22 @@ pub mod control;
 pub mod master;
 pub mod router;
 
+// Optional residency-index backends (the ART-vs-LSM study) live here as
+// feature-gated *modules*, not separate crates — `holt` is pure Rust, `rocksdb`
+// pulls C++/libclang, both off by default so the core build stays light.
+#[cfg(feature = "holt")]
+pub mod index_holt;
+#[cfg(feature = "rocksdb")]
+pub mod index_rocksdb;
+
 pub use control::*;
 pub use master::*;
 pub use router::*;
+
+#[cfg(feature = "holt")]
+pub use index_holt::HoltIndex;
+#[cfg(feature = "rocksdb")]
+pub use index_rocksdb::RocksIndex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KvBlockKey {

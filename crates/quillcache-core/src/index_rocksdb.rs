@@ -1,32 +1,34 @@
-//! Holt (persistent ART) residency-index backend — the ART arm of the
-//! ART-vs-LSM study.
+//! RocksDB (LSM) residency-index backend for QuillCache — the LSM baseline in
+//! the ART-vs-LSM study.
 //!
-//! Holt is an adaptive-radix-tree store for **path-shaped keys** with crash-safe
-//! (WAL) persistence, so an identity-scoped `prefix_scan` maps directly onto
-//! `Tree::scan(prefix)` and is prefix-native (no full-table scan, no LSM
-//! compaction). Keys use the same path-shaped encoding as the RocksDB backend:
+//! Keys are encoded so that an identity-scoped `prefix_scan` becomes a RocksDB
+//! range scan:
 //!
 //! ```text
 //! PRIMARY \0 model \0 tokenizer \0 adapter \0 tenant \0 prefix_hash \0
 //!   block_hash \0 block_index(BE) \0 worker \0 tier   ->   serialized CacheResidency
 //! ```
 //!
-//! A second, `SECONDARY`-tagged namespace is a reverse index that lets eviction
-//! seek straight to a block instead of scanning the whole identity scope:
+//! `put` writes the record above plus a `SECONDARY`-tagged reverse-index entry
+//! so eviction can seek straight to a block instead of scanning the scope:
 //!
 //! ```text
 //! SECONDARY \0 model \0 tokenizer \0 adapter \0 tenant \0 block_hash \0
 //!   worker \0 tier \0 prefix_hash \0 block_index(BE)   ->   the primary key
 //! ```
 //!
-//! `remove_block` is given a block hash but not its prefix, so against the
-//! primary order alone it would scan + deserialize the whole scope (the churn
-//! bottleneck the index benchmark surfaced). The reverse index makes it an
-//! O(matches) seek, at the cost of a second key per residency on disk.
+//! Both are single writes (no read-modify-write), so the store still behaves
+//! like a real LSM under ingest. The value of a primary key is one
+//! [`CacheResidency`]; a block resident on several workers/tiers maps to several
+//! keys sharing a block prefix. `remove_block` is given a block hash but not its
+//! prefix, so without the reverse index it would scan + deserialize the whole
+//! scope (the churn bottleneck the index benchmark surfaced); with it, eviction
+//! is an O(matches) range seek, at the cost of a second key per residency.
 
-use holt::{Durability, RangeEntry, Tree, TreeBuilder};
-use quillcache_core::{CacheResidency, IdentityScope, IndexBackend, IndexMetrics, KvBlockKey};
+use crate::{CacheResidency, IdentityScope, IndexBackend, IndexMetrics, KvBlockKey};
+use rocksdb::{Direction, IteratorMode, Options, DB};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const SEP: u8 = 0x00;
 /// Namespace tag for primary residency records (prefix-ordered).
@@ -34,54 +36,95 @@ const PRIMARY: u8 = 0x01;
 /// Namespace tag for the reverse `block_hash -> primary key` index.
 const SECONDARY: u8 = 0x02;
 
-/// A persistent residency index backed by Holt (an adaptive radix tree).
-pub struct HoltIndex {
-    tree: Tree,
-    dir: PathBuf,
+/// An owned RocksDB key or value, as yielded by the iterator.
+type OwnedKey = Box<[u8]>;
+
+/// A persistent residency index backed by RocksDB (an LSM-tree store).
+pub struct RocksIndex {
+    db: DB,
+    path: PathBuf,
+    /// The `Options` used to open the DB, kept so its shared statistics handle can
+    /// be read back for write-amplification. Behind a `Mutex` so `RocksIndex`
+    /// stays `Sync`.
+    opts: Mutex<Options>,
 }
 
-impl std::fmt::Debug for HoltIndex {
+impl std::fmt::Debug for RocksIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HoltIndex").field("dir", &self.dir).finish()
+        f.debug_struct("RocksIndex")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
-impl HoltIndex {
-    /// Open (creating if missing) a Holt-backed index under directory `dir`.
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self, holt::Error> {
-        let dir = dir.as_ref().to_path_buf();
-        let _ = std::fs::create_dir_all(&dir);
-        let tree = TreeBuilder::new(dir.join("index.holt"))
-            .durability(Durability::Wal { sync: false })
-            .open()?;
-        Ok(Self { tree, dir })
+impl RocksIndex {
+    /// Open (creating if missing) a RocksDB-backed index at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, rocksdb::Error> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        // Track flush/compaction bytes so we can report real LSM write amplification.
+        opts.enable_statistics();
+        // A small memtable so even a modest residency index flushes and compacts
+        // across levels — otherwise everything stays in one memtable and the LSM
+        // write-amplification it pays at scale never shows up.
+        opts.set_write_buffer_size(256 * 1024);
+        opts.set_max_bytes_for_level_base(1024 * 1024);
+        let db = DB::open(&opts, path.as_ref())?;
+        Ok(Self {
+            db,
+            path: path.as_ref().to_path_buf(),
+            opts: Mutex::new(opts),
+        })
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    /// Checkpoint the WAL so on-disk state reflects all writes.
-    pub fn flush(&self) {
-        let _ = self.tree.checkpoint();
+    /// Real LSM write amplification: (bytes flushed to L0 + bytes rewritten by
+    /// compaction) / user bytes written, from RocksDB's own statistics. This is
+    /// the cost an LSM pays — rewriting data during compaction — that an
+    /// append-only / ART store does not. Returns `(physical_bytes, write_amp)`.
+    pub fn write_amplification(&self) -> (u64, f64) {
+        let stats = self
+            .opts
+            .lock()
+            .ok()
+            .and_then(|opts| opts.get_statistics())
+            .unwrap_or_default();
+        // Lines look like: "rocksdb.flush.write.bytes COUNT : 12345".
+        let ticker = |name: &str| -> u64 {
+            stats
+                .lines()
+                .find(|line| line.trim_start().starts_with(name))
+                .and_then(|line| line.rsplit(':').next())
+                .and_then(|tail| tail.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let flush = ticker("rocksdb.flush.write.bytes");
+        let compaction = ticker("rocksdb.compact.write.bytes");
+        let physical = flush + compaction;
+        // Relative to the live data finally retained on disk: how many times each
+        // byte of stored data was physically written (flush once, then rewritten
+        // by each compaction). ~1× with no compaction, higher as data cascades
+        // through levels.
+        let live = self.on_disk_bytes().max(1);
+        let amp = physical as f64 / live as f64;
+        (physical, amp)
     }
 
-    /// On-disk footprint (sum of files under the index directory), in bytes.
+    /// Force a full compaction so on-disk size reflects the merged state.
+    pub fn compact(&self) {
+        self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
+    }
+
+    /// Total size of the on-disk SST files, in bytes.
     pub fn on_disk_bytes(&self) -> u64 {
-        fn dir_size(path: &Path) -> u64 {
-            let mut total = 0;
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    match entry.metadata() {
-                        Ok(meta) if meta.is_dir() => total += dir_size(&entry.path()),
-                        Ok(meta) => total += meta.len(),
-                        Err(_) => {}
-                    }
-                }
-            }
-            total
-        }
-        dir_size(&self.dir)
+        self.db
+            .property_int_value("rocksdb.total-sst-files-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     fn enc_scope(
@@ -139,7 +182,7 @@ impl HoltIndex {
 
     /// Reverse-index key: `SECONDARY \0 scope \0 block_hash \0 worker \0 tier \0
     /// prefix_hash \0 block_index`. Ordering block_hash + worker first is what
-    /// makes `remove_block` a bounded seek. The value is the primary key.
+    /// makes `remove_block` a bounded range seek. The value is the primary key.
     fn secondary_key_for(residency: &CacheResidency) -> Vec<u8> {
         let k = &residency.key;
         let mut buf = vec![SECONDARY];
@@ -182,33 +225,37 @@ impl HoltIndex {
 
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<CacheResidency> {
         let mut out = Vec::new();
-        for entry in self.tree.scan(prefix) {
-            let entry = match entry {
-                Ok(entry) => entry,
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, Direction::Forward))
+        {
+            let (k, v) = match item {
+                Ok(kv) => kv,
                 Err(_) => break,
             };
-            if let RangeEntry::Key { value, .. } = entry {
-                if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&value) {
-                    out.push(residency);
-                }
+            if !k.starts_with(prefix) {
+                break;
+            }
+            if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&v) {
+                out.push(residency);
             }
         }
         out
     }
 }
 
-impl IndexBackend for HoltIndex {
+impl IndexBackend for RocksIndex {
     fn name(&self) -> &str {
-        "holt"
+        "rocksdb"
     }
 
     fn put(&mut self, residency: CacheResidency) {
         let primary = Self::primary_key_for(&residency);
         if let Ok(value) = serde_json::to_vec(&residency) {
-            let _ = self.tree.put(&primary, &value);
+            let _ = self.db.put(&primary, value);
             // Reverse index: block_hash -> primary key, for O(matches) eviction.
             let secondary = Self::secondary_key_for(&residency);
-            let _ = self.tree.put(&secondary, &primary);
+            let _ = self.db.put(&secondary, &primary);
         }
     }
 
@@ -235,70 +282,84 @@ impl IndexBackend for HoltIndex {
         // instead of scanning the whole identity scope. Each hit's value is the
         // primary key to drop; we drop the reverse entry alongside it.
         let prefix = Self::remove_scan_prefix(scope, worker_id, block_hash);
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for entry in self.tree.scan(&prefix) {
-            let entry = match entry {
-                Ok(entry) => entry,
+        let mut pairs: Vec<(OwnedKey, OwnedKey)> = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix.as_slice(), Direction::Forward))
+        {
+            let (sec_key, prim_key) = match item {
+                Ok(kv) => kv,
                 Err(_) => break,
             };
-            if let RangeEntry::Key { key, value, .. } = entry {
-                pairs.push((key.to_vec(), value.to_vec()));
+            if !sec_key.starts_with(prefix.as_slice()) {
+                break;
             }
+            pairs.push((sec_key, prim_key));
         }
         let mut removed = 0;
-        for (secondary, primary) in pairs {
-            if self.tree.delete(primary.as_slice()).unwrap_or(false) {
+        for (sec_key, prim_key) in pairs {
+            if self.db.delete(&prim_key).is_ok() {
                 removed += 1;
             }
-            let _ = self.tree.delete(secondary.as_slice());
+            let _ = self.db.delete(&sec_key);
         }
         removed
     }
 
     fn clear_worker(&mut self, worker_id: &str) {
-        let mut to_delete: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for entry in self.tree.scan(&[PRIMARY]) {
-            let entry = match entry {
-                Ok(entry) => entry,
+        let prefix = [PRIMARY];
+        let mut to_delete: Vec<(OwnedKey, Vec<u8>)> = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = match item {
+                Ok(kv) => kv,
                 Err(_) => break,
             };
-            if let RangeEntry::Key { key, value, .. } = entry {
-                if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&value) {
-                    if residency.worker_id == worker_id {
-                        to_delete.push((key.to_vec(), Self::secondary_key_for(&residency)));
-                    }
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&v) {
+                if residency.worker_id == worker_id {
+                    to_delete.push((k, Self::secondary_key_for(&residency)));
                 }
             }
         }
         for (primary, secondary) in to_delete {
-            let _ = self.tree.delete(primary.as_slice());
-            let _ = self.tree.delete(secondary.as_slice());
+            let _ = self.db.delete(&primary);
+            let _ = self.db.delete(&secondary);
         }
     }
 
     fn clear(&mut self) {
-        let mut to_delete: Vec<Vec<u8>> = Vec::new();
-        for entry in self.tree.range() {
-            if let Ok(RangeEntry::Key { key, .. }) = entry {
-                to_delete.push(key.to_vec());
-            }
-        }
-        for key in to_delete {
-            let _ = self.tree.delete(key.as_slice());
+        let keys: Vec<_> = self
+            .db
+            .iterator(IteratorMode::Start)
+            .filter_map(Result::ok)
+            .map(|(k, _)| k)
+            .collect();
+        for k in keys {
+            let _ = self.db.delete(&k);
         }
     }
 
     fn snapshot(&self) -> Vec<CacheResidency> {
+        let prefix = [PRIMARY];
         let mut out = Vec::new();
-        for entry in self.tree.scan(&[PRIMARY]) {
-            let entry = match entry {
-                Ok(entry) => entry,
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (k, v) = match item {
+                Ok(kv) => kv,
                 Err(_) => break,
             };
-            if let RangeEntry::Key { value, .. } = entry {
-                if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&value) {
-                    out.push(residency);
-                }
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Ok(residency) = serde_json::from_slice::<CacheResidency>(&v) {
+                out.push(residency);
             }
         }
         out
@@ -306,15 +367,23 @@ impl IndexBackend for HoltIndex {
 
     fn len(&self) -> usize {
         // Count only primary residency records, not reverse-index entries.
-        self.tree
-            .scan(&[PRIMARY])
-            .into_iter()
-            .filter_map(Result::ok)
-            .count()
+        let prefix = [PRIMARY];
+        let mut n = 0;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let Ok((k, _)) = item else { break };
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            n += 1;
+        }
+        n
     }
 
     fn flush(&self) {
-        let _ = self.tree.checkpoint();
+        let _ = self.db.flush_wal(true);
     }
 
     fn persistent(&self) -> bool {
@@ -335,10 +404,10 @@ impl IndexBackend for HoltIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quillcache_core::KvBlockKey;
+    use crate::KvBlockKey;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("quillcache-holt-{}-{}", tag, std::process::id()))
+        std::env::temp_dir().join(format!("quillcache-rocks-{}-{}", tag, std::process::id()))
     }
 
     fn scope() -> IdentityScope {
@@ -359,23 +428,26 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let mut idx = HoltIndex::open(&dir).unwrap();
+            let mut idx = RocksIndex::open(&dir).unwrap();
             idx.put(CacheResidency::hbm("w0", block("root", "b0", 0), 1024));
             idx.put(CacheResidency::hbm("w0", block("b0", "b1", 1), 1024));
+            // prefix_scan is identity-scoped and prefix-addressed.
             assert_eq!(idx.prefix_scan(&scope(), "root").len(), 1);
             assert_eq!(idx.prefix_scan(&scope(), "b0").len(), 1);
+            // a different tenant with the same prefix must not match.
             let other = IdentityScope {
                 tenant_id: "tenant-b".to_string(),
                 ..scope()
             };
             assert!(idx.prefix_scan(&other, "root").is_empty());
             assert_eq!(idx.len(), 2);
+            // remove one block.
             assert_eq!(idx.remove_block(&scope(), "w0", "b0"), 1);
             assert_eq!(idx.len(), 1);
-            idx.flush();
         }
+        // reopen: state survives (persistence).
         {
-            let idx = HoltIndex::open(&dir).unwrap();
+            let idx = RocksIndex::open(&dir).unwrap();
             assert!(idx.persistent());
             assert_eq!(idx.len(), 1);
             assert_eq!(idx.prefix_scan(&scope(), "b0").len(), 1);
@@ -388,7 +460,7 @@ mod tests {
         let dir = temp_dir("reverse");
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let mut idx = HoltIndex::open(&dir).unwrap();
+            let mut idx = RocksIndex::open(&dir).unwrap();
             // Same block hash resident on two workers under the same prefix.
             idx.put(CacheResidency::hbm("w0", block("root", "b0", 0), 1024));
             idx.put(CacheResidency::hbm("w1", block("root", "b0", 0), 1024));
@@ -400,11 +472,10 @@ mod tests {
             assert_eq!(idx.len(), 2);
             assert_eq!(idx.prefix_scan(&scope(), "root").len(), 1);
             assert_eq!(idx.remove_block(&scope(), "w0", "b0"), 0); // idempotent
-            idx.flush();
         }
         {
             // Reverse index persisted: eviction still seeks correctly after reopen.
-            let mut idx = HoltIndex::open(&dir).unwrap();
+            let mut idx = RocksIndex::open(&dir).unwrap();
             assert_eq!(idx.len(), 2);
             assert_eq!(idx.remove_block(&scope(), "w1", "b0"), 1);
             assert!(idx.prefix_scan(&scope(), "root").is_empty());

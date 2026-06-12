@@ -431,7 +431,7 @@ fn build_index(config: &GatewayConfig) -> Box<dyn IndexBackend> {
                 .index_path
                 .clone()
                 .unwrap_or_else(|| "quillcache-residency".to_string());
-            match quillcache_index_holt::HoltIndex::open(&path) {
+            match quillcache_core::HoltIndex::open(&path) {
                 Ok(index) => {
                     tracing::info!(path = %path, "persistent ART (Holt) residency index");
                     Box::new(index)
@@ -448,7 +448,7 @@ fn build_index(config: &GatewayConfig) -> Box<dyn IndexBackend> {
                 .index_path
                 .clone()
                 .unwrap_or_else(|| "quillcache-residency".to_string());
-            match quillcache_index_rocksdb::RocksIndex::open(&path) {
+            match quillcache_core::RocksIndex::open(&path) {
                 Ok(index) => {
                     tracing::info!(path = %path, "persistent LSM (RocksDB) residency index");
                     Box::new(index)

@@ -26,16 +26,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --workspace --exclude quillcache-index-rocksdb --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: build
-        run: cargo build --workspace --exclude quillcache-index-rocksdb
+        run: cargo build --workspace
 
       - name: test
-        run: cargo test --workspace --exclude quillcache-index-rocksdb
+        run: cargo test --workspace
 
-      - name: build CLI with holt feature
-        run: cargo build -p quillcache --features holt
+      - name: holt backend (ART, pure Rust) — clippy · test · CLI
+        run: |
+          cargo clippy -p quillcache-core --features holt --all-targets -- -D warnings
+          cargo test -p quillcache-core --features holt
+          cargo build -p quillcache --features holt
 
   rocksdb:
     name: rocksdb backend (LSM)
@@ -54,10 +57,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: clippy
-        run: cargo clippy -p quillcache-index-rocksdb --all-targets -- -D warnings
+        run: cargo clippy -p quillcache-core --features rocksdb --all-targets -- -D warnings
 
       - name: test
-        run: cargo test -p quillcache-index-rocksdb
+        run: cargo test -p quillcache-core --features rocksdb
 
       - name: build CLI with rocksdb feature
         run: cargo build -p quillcache --features rocksdb

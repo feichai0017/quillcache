@@ -1024,8 +1024,6 @@ dependencies = [
  "clap",
  "futures-util",
  "quillcache-core",
- "quillcache-index-holt",
- "quillcache-index-rocksdb",
  "quillcache-store",
  "reqwest",
  "serde",
@@ -1041,25 +1039,9 @@ dependencies = [
 name = "quillcache-core"
 version = "1.0.0-alpha.1"
 dependencies = [
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "quillcache-index-holt"
-version = "1.0.0-alpha.1"
-dependencies = [
  "holt",
- "quillcache-core",
- "serde_json",
-]
-
-[[package]]
-name = "quillcache-index-rocksdb"
-version = "1.0.0-alpha.1"
-dependencies = [
- "quillcache-core",
  "rocksdb",
+ "serde",
  "serde_json",
  "thiserror",
 ]

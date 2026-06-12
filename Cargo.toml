@@ -4,15 +4,12 @@ members = [
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
-    "crates/quillcache-index-rocksdb",
-    "crates/quillcache-index-holt",
 ]
 default-members = [
     ".",
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
-    "crates/quillcache-index-holt",
 ]
 # The CUDA device tier is excluded so the default build never resolves/compiles
 # cudarc on a machine with no NVIDIA GPU. Build it standalone on a GPU box:
@@ -51,8 +48,6 @@ futures-util = "0.3"
 reqwest = { workspace = true }
 quillcache-core = { version = "1.0.0-alpha.1", path = "crates/quillcache-core" }
 quillcache-store = { version = "1.0.0-alpha.1", path = "crates/quillcache-store" }
-quillcache-index-rocksdb = { version = "1.0.0-alpha.1", path = "crates/quillcache-index-rocksdb", optional = true }
-quillcache-index-holt = { version = "1.0.0-alpha.1", path = "crates/quillcache-index-holt", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -62,10 +57,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]
-# Optional RocksDB (LSM) index backend. Off by default so `cargo install
-# quillcache` stays light and the core CI job needs no C++/libclang toolchain.
-rocksdb = ["dep:quillcache-index-rocksdb"]
+# Optional RocksDB (LSM) index backend — forwards to the feature-gated module in
+# quillcache-core. Off by default so `cargo install quillcache` stays light and
+# the core CI job needs no C++/libclang toolchain.
+rocksdb = ["quillcache-core/rocksdb"]
 # Optional Holt (persistent ART) index backend. Pure Rust; off by default to keep
 # the installed binary minimal. Also lets the online gateway back its residency
 # index with Holt (`index: holt` in the gateway config).
-holt = ["dep:quillcache-index-holt"]
+holt = ["quillcache-core/holt"]
