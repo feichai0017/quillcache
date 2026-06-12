@@ -29,6 +29,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 pub mod transfer;
 pub use transfer::*;
@@ -577,6 +578,10 @@ pub struct PooledStore {
     local: Arc<Mutex<LocalKvStore>>,
     transfer: Arc<dyn Transfer>,
     registry: Arc<dyn NodeRegistry>,
+    /// In-flight cross-node fetches, keyed by block. A concurrent burst of
+    /// requests that all miss locally coalesces onto ONE peer fetch (the others
+    /// wait on the broadcast) — the single-flight / cache-stampede guard.
+    in_flight: Arc<Mutex<HashMap<KvBlockKey, broadcast::Sender<Option<Bytes>>>>>,
 }
 
 impl PooledStore {
@@ -589,6 +594,7 @@ impl PooledStore {
             local,
             transfer,
             registry,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -604,6 +610,12 @@ impl PooledStore {
     /// via the registry, fetch over the transfer engine, admit locally, and
     /// return. A local cross-identity match is refused before any fetch — the
     /// identity guard wins over a network round trip.
+    ///
+    /// Cross-node fetches are **single-flighted**: when a burst of concurrent
+    /// requests all miss this block locally, one becomes the leader and does the
+    /// peer fetch while the rest wait on its result — so a thundering herd of
+    /// cold requests for the same block triggers one network round trip, not one
+    /// per request (Mooncake/Dynamo pools need this; Go calls it `singleflight`).
     pub async fn get_pooled(
         &self,
         key: &KvBlockKey,
@@ -617,8 +629,53 @@ impl PooledStore {
         match local {
             Ok(bytes) => return Ok(bytes),
             Err(StoreError::NotFound) => {}
+            // A local cross-identity match is refused before any fetch.
             Err(other) => return Err(other),
         }
+
+        // Single-flight admission: join an in-flight fetch for this key, or lead.
+        enum Flight {
+            Leader,
+            Follower(broadcast::Receiver<Option<Bytes>>),
+        }
+        let flight = {
+            let mut inflight = self.in_flight.lock().unwrap();
+            match inflight.get(key) {
+                Some(tx) => Flight::Follower(tx.subscribe()),
+                None => {
+                    let (tx, _rx) = broadcast::channel(1);
+                    inflight.insert(key.clone(), tx);
+                    Flight::Leader
+                }
+            }
+        };
+
+        if let Flight::Follower(mut rx) = flight {
+            // Wait for the leader and share its result; a dropped/missed leader
+            // reads as a genuine pool-wide miss.
+            return match rx.recv().await {
+                Ok(Some(bytes)) => Ok(bytes),
+                _ => Err(StoreError::NotFound),
+            };
+        }
+
+        // Leader: do the actual peer fetch, then publish to followers and clean up.
+        let result = self.fetch_from_peers(key, located_nodes).await;
+        let payload = result.as_ref().ok().cloned();
+        if let Some(tx) = self.in_flight.lock().unwrap().remove(key) {
+            let _ = tx.send(payload);
+        }
+        result
+    }
+
+    /// The peer-fetch loop: try each located node (skipping self), resolve its
+    /// address, fetch over the transfer engine, admit locally. A peer that lacks
+    /// the block (stale index) or is unreachable falls through to the next.
+    async fn fetch_from_peers(
+        &self,
+        key: &KvBlockKey,
+        located_nodes: &[String],
+    ) -> Result<Bytes, StoreError> {
         for node in located_nodes {
             if node == self.registry.this_node() {
                 continue;
@@ -626,8 +683,6 @@ impl PooledStore {
             let Some(addr) = self.registry.addr_of(node) else {
                 continue;
             };
-            // A peer that doesn't have it (stale index entry) or is unreachable
-            // just falls through to the next located node.
             if let Ok(bytes) = self.transfer.read(&addr, key).await {
                 // Keyed by the exact identity-bearing key, so safe to admit.
                 let _ = self.local.lock().unwrap().put(key.clone(), bytes.clone());
@@ -1411,5 +1466,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// A peer whose fetch is slow (so concurrent followers overlap the leader's
+    /// fetch window) — wrap it in [`CountingTransfer`] to count actual fetches.
+    #[derive(Debug)]
+    struct SlowPeer {
+        data: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl Transfer for SlowPeer {
+        fn name(&self) -> &str {
+            "slow-peer"
+        }
+        fn link_class(&self) -> LinkClass {
+            LinkClass::Tcp
+        }
+        async fn read(&self, _r: &NodeAddr, _k: &KvBlockKey) -> Result<Bytes, TransferError> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(self.data.clone())
+        }
+        async fn write(&self, _: &NodeAddr, _: &KvBlockKey, _: Bytes) -> Result<(), TransferError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_misses_single_flight_into_one_peer_fetch() {
+        // node-a: an empty local pool whose peer fetch is slow + counted, so a
+        // burst of concurrent requests for the same block overlaps in the fetch.
+        let dir_a = tmp("sf-a");
+        let store_a = Arc::new(Mutex::new(
+            LocalKvStore::new(&dir_a, 1 << 20, 1 << 20).unwrap(),
+        ));
+        let counter = Arc::new(CountingTransfer::new(Arc::new(SlowPeer {
+            data: Bytes::from_static(b"hot-shared-prefix"),
+        })));
+        let registry = Arc::new(StaticRegistry::new("node-a").with_node("node-b", "peer:0"));
+        let node = PooledStore::new(store_a, counter.clone(), registry);
+
+        // 16 concurrent requests, all missing locally, all needing one block.
+        let located = vec!["node-b".to_string()];
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let (node, located) = (node.clone(), located.clone());
+            handles.push(tokio::spawn(async move {
+                node.get_pooled(&key("ten-a", "hot"), &located).await
+            }));
+        }
+        for h in handles {
+            assert_eq!(&h.await.unwrap().unwrap()[..], b"hot-shared-prefix");
+        }
+
+        // Single-flight collapsed 16 concurrent cold reads into ONE peer fetch.
+        assert_eq!(counter.reads(), 1);
+
+        // The block is now resident locally — a later read needs no fetch at all.
+        let cached = node
+            .get_pooled(&key("ten-a", "hot"), &located)
+            .await
+            .unwrap();
+        assert_eq!(&cached[..], b"hot-shared-prefix");
+        assert_eq!(counter.reads(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir_a);
     }
 }

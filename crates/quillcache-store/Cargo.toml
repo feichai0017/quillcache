@@ -14,11 +14,11 @@ crc32fast = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync"] }
 
 [features]
 # RDMA transfer backend (ibverbs). Reserved seam — stubbed until a NIC is available.
 rdma = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }

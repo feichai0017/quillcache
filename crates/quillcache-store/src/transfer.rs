@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use quillcache_core::{CacheTier, KvBlockKey};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -87,6 +88,55 @@ pub trait Transfer: Send + Sync + std::fmt::Debug {
         key: &KvBlockKey,
         data: Bytes,
     ) -> Result<(), TransferError>;
+}
+
+/// A [`Transfer`] decorator that counts `read` calls — the actual cross-node
+/// fetches (network round trips). Wrap any backend to measure how many peer
+/// fetches single-flight coalescing avoided: under a concurrent burst for one
+/// block, `reads()` counts one fetch per node, not one per request.
+#[derive(Debug)]
+pub struct CountingTransfer {
+    inner: Arc<dyn Transfer>,
+    reads: AtomicUsize,
+}
+
+impl CountingTransfer {
+    pub fn new(inner: Arc<dyn Transfer>) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// The number of actual `read` (peer fetch) calls made through this decorator.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl Transfer for CountingTransfer {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn link_class(&self) -> LinkClass {
+        self.inner.link_class()
+    }
+
+    async fn read(&self, remote: &NodeAddr, key: &KvBlockKey) -> Result<Bytes, TransferError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read(remote, key).await
+    }
+
+    async fn write(
+        &self,
+        remote: &NodeAddr,
+        key: &KvBlockKey,
+        data: Bytes,
+    ) -> Result<(), TransferError> {
+        self.inner.write(remote, key, data).await
+    }
 }
 
 /// In-process transfer over a shared map. The fast path for same-machine moves

@@ -14,8 +14,8 @@
 use bytes::Bytes;
 use quillcache_core::{CacheResidency, CacheTier, KvBlockKey, Master};
 use quillcache_store::{
-    serve_listener, EngineConnector, LocalKvStore, PooledStore, StaticRegistry, StoreBlockSource,
-    StoreError, TcpTransfer,
+    serve_listener, CountingTransfer, EngineConnector, LocalKvStore, PooledStore, StaticRegistry,
+    StoreBlockSource, StoreError, TcpTransfer,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,6 +73,9 @@ pub async fn run_cluster(
 
     // Each node's connector gets the cluster's node→addr map from the master.
     let node_map = master.lock().unwrap().nodes().clone();
+    // One shared transfer engine, wrapped to count ACTUAL cross-node fetches, so
+    // we can show single-flight coalescing the concurrent duplicate reads.
+    let transfer = Arc::new(CountingTransfer::new(Arc::new(TcpTransfer)));
     let nodes: Vec<Node> = (0..nodes_n)
         .map(|i| {
             let id = format!("node-{i}");
@@ -80,8 +83,7 @@ pub async fn run_cluster(
             for (n, a) in &node_map {
                 registry = registry.with_node(n.clone(), a.clone());
             }
-            let pool =
-                PooledStore::new(stores[i].clone(), Arc::new(TcpTransfer), Arc::new(registry));
+            let pool = PooledStore::new(stores[i].clone(), transfer.clone(), Arc::new(registry));
             Node {
                 id: id.clone(),
                 store: stores[i].clone(),
@@ -102,13 +104,13 @@ pub async fn run_cluster(
     // needing the shared prefix. A node that doesn't have it locates it via the
     // master and fetches it from a peer over TCP, then caches it.
     let local_hits = Arc::new(AtomicUsize::new(0));
-    let cross_fetches = Arc::new(AtomicUsize::new(0));
+    let cold_arrivals = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for r in 0..requests {
         let node = nodes[r % nodes_n].clone();
         let master = master.clone();
         let shared = shared.clone();
-        let (lh, cf) = (local_hits.clone(), cross_fetches.clone());
+        let (lh, cf) = (local_hits.clone(), cold_arrivals.clone());
         handles.push(tokio::spawn(async move {
             let was_local = node.store.lock().unwrap().tier_of(&shared).is_some();
             let located = master.lock().unwrap().locate_nodes(&shared);
@@ -138,12 +140,14 @@ pub async fn run_cluster(
     let guarded = nodes[0].connector.reload(&cross, &[]).await;
     let refused = matches!(guarded, Err(StoreError::Unsafe(_)));
 
-    let (lh, cf) = (
+    let (lh, cold) = (
         local_hits.load(Ordering::Relaxed),
-        cross_fetches.load(Ordering::Relaxed),
+        cold_arrivals.load(Ordering::Relaxed),
     );
+    let actual = transfer.reads();
     println!(
-        "  workload: {requests} requests -> {lh} local hits, {cf} cross-node fetches over TCP"
+        "  workload: {requests} requests -> {lh} local hits, {cold} arrived cold -> \
+         {actual} actual cross-node fetches over TCP (single-flight coalesced {cold}->{actual})"
     );
     println!(
         "  identity guard: tenant-b's request for tenant-a's prefix was {}",
