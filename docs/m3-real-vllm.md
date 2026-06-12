@@ -47,8 +47,17 @@ request hints / prefix hashing, but TTFT and responses are real.
    ```
 
 To show the **cache-aware routing TTFT benefit** you need **≥2 vLLM instances**
-(two engines in the gateway config) and a shared-prefix workload — then compare
-`GreedyStatePlaneRouter` vs `LeastLoadedRouter`.
+and a shared-prefix workload — see [examples/quillcache-modal.yaml](../examples/quillcache-modal.yaml),
+a ready 2-engine fleet on Modal L4. Compare the gateway `policy:` knob:
+`dynamo-cost` (cache-aware, the KV-router cost function) vs `round-robin`
+(cache-blind baseline). Warm both engines first so the measured TTFT is
+steady-state, not Modal scale-to-zero cold start:
+
+```bash
+python bench/run_trace.py --base-url http://127.0.0.1:8080 \
+    --model Qwen/Qwen2.5-0.5B-Instruct --requests 64 --concurrency 8 \
+    --warmup-urls https://<engine-a>.modal.run,https://<engine-b>.modal.run
+```
 
 ## Tier 2 — precise KV residency (add the bridge)
 
@@ -76,7 +85,7 @@ swapping in the real vLLM URL is then a one-line change.
 
 ## What to capture
 
-- TTFT p50/p99 (from `run_trace.py`), `GreedyStatePlaneRouter` vs `LeastLoadedRouter`.
+- TTFT p50/p99 (from `run_trace.py`), `policy: dynamo-cost` vs `policy: round-robin`.
 - `x-quillcache-*` headers: selected engine, mode, prefill/decode engine ids,
   local hits, transfer/recompute blocks, planner actions, cache actions.
 - `/v1/state`: resident KV blocks per engine (with the bridge running).
