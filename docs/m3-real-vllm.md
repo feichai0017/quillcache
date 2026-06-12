@@ -4,6 +4,11 @@ Goal: run the QuillCache gateway in front of a **real** vLLM on a cloud GPU,
 drive it with a shared-prefix workload, and measure **real TTFT** plus the
 routing decision headers — and, with the bridge, real KV residency state.
 
+> This doc is the **control plane** (the gateway routes; KV *events* report
+> residency). For the **data plane** — an engine moving real KV *bytes* in and out
+> of the distributed pool via `quillcache master` + `quillcache node` + a vLLM KV
+> connector — see [real-engine-pool.md](real-engine-pool.md).
+
 What QuillCache provides (this repo) vs what you run:
 
 | Piece | Where it runs | Status |
