@@ -1,0 +1,23 @@
+[package]
+name = "quillcache-transfer-engine"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "Faithful Rust port of Mooncake's Transfer Engine: TransferEngine facade + MultiTransport + Transport backends (TCP real, RDMA/NVMe-oF/GPU reserved) + TransferMetadata + Topology; one-sided (segment, offset) transfers between registered memory"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+
+[features]
+# RDMA transport backend (ibverbs / GPUDirect-RDMA). Reserved seam — the trait
+# is implemented as an Unsupported stub until an RDMA NIC is wired.
+rdma = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

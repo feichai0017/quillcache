@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/quillcache-core",
     "crates/quillcache-store",
+    "crates/quillcache-transfer-engine",
     "crates/quillcache-index-rocksdb",
     "crates/quillcache-index-holt",
 ]
@@ -10,6 +11,7 @@ default-members = [
     ".",
     "crates/quillcache-core",
     "crates/quillcache-store",
+    "crates/quillcache-transfer-engine",
     "crates/quillcache-index-holt",
 ]
 # The CUDA device tier is excluded so the default build never resolves/compiles

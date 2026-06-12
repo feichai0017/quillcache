@@ -1079,6 +1079,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quillcache-transfer-engine"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
