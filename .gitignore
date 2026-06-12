@@ -16,6 +16,7 @@ target/
 /target
 .vscode
 .history
+.claude/
 AGENTS.md
 GEMINI.md
 /docs/book

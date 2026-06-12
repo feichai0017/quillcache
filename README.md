@@ -5,461 +5,174 @@
 [![page](https://img.shields.io/badge/page-quillcache-5ee0c0.svg)](https://feichai0017.github.io/quillcache/)
 [![crates.io](https://img.shields.io/badge/crates.io-quillcache-orange.svg)](https://crates.io/crates/quillcache)
 
-> **QuillCache is a research platform and control-plane prototype for
-> identity-aware, persistent, and policy-driven KV cache reuse in LLM serving.**
+> **QuillCache is a Mooncake-style distributed KV cache pool and control plane for
+> LLM serving, written in Rust** — replicating the architecture of NVIDIA Dynamo
+> and Moonshot's Mooncake, plus two properties the production data planes leave
+> implicit: **identity-governed safe reuse** and a **crash-consistent persistent
+> tier**.
 
-**▶ Overview & results: [feichai0017.github.io/quillcache](https://feichai0017.github.io/quillcache/)**
+QuillCache sits beside real inference engines (vLLM, SGLang) and owns the KV
+cache as a resource:
 
-QuillCache is a **vendor-neutral KV cache control plane and evaluation platform**
-for LLM inference. It does not run models and it does not move KV tensors. It
-sits in front of / beside real engines (vLLM, SGLang) and the KV data plane
-(LMCache, NVIDIA Dynamo KVBM, Tencent FlexKV) and owns the *metadata and the
-decisions*: block identity, residency, routing, and reuse / transfer / recompute
-/ evict policy. Those data planes move and store KV tensors; QuillCache is the
-neutral layer **above** them — it can drive and compare them, and it enforces the
-one thing they leave implicit: **identity-governed safe reuse** (below).
+- a **byte pool** — DRAM + SSD tiers that hold real KV block bytes, with
+  capacity-driven demotion and eviction;
+- a **transfer engine** — moves blocks between nodes (TCP today, RDMA reserved);
+- a **residency index** — maps each block (by identity) to where it lives
+  (node + tier), persistent so it survives a restart;
+- a **control plane / Conductor** — routes requests cache-aware (the Dynamo
+  KV-router cost function), governs reuse, and meters SLO.
 
-It is built as a **research instrument**: engines, routing policies, and index
-backends are all pluggable, so you can replay one workload across many
-combinations and measure them apples-to-apples.
-
-Runtime PD roles, planner actions, tiered HBM/DRAM/SSD cache state, and an HTTP
-action sink now run in the gateway path; see
-[`docs/runtime-control-plane.md`](docs/runtime-control-plane.md).
-
-## What it is / is not
-
-| It IS | It is NOT |
-| --- | --- |
-| a gateway in front of real engines | a new vLLM / SGLang (no kernels, no model execution) |
-| a residency index fed by real KV events | a new LMCache / FlexKV (not a KV **tensor** data plane) |
-| a policy engine (route / reuse / recompute / pin / evict) | a new Dynamo KVBM (not a distributed block memory manager) |
-| a research instrument comparing policies **and** index backends | a paper-only simulator (it connects to real engines) |
-| the experiment substrate for Holt / RocksDB / Memory / FS indexes | a store for large KV **tensors** |
-
-## Layering
-
-```text
-vLLM / SGLang        = inference engines (run the model, own live KV tensors)
-LMCache/KVBM/FlexKV  = KV tensor data plane / offload backend
-QuillCache           = control plane + research platform   <-- this repo
-Holt                 = persistent ART index backend
-RocksDB              = LSM index baseline
-```
-
-QuillCache holds **identity + residency metadata** and makes **decisions**. The
-KV tensor bytes live in the data plane. The two planes meet at the *index* and
-the *storage tier*, never as the same object.
+> It does **not** run models — no transformer kernels, no attention. The CUDA
+> tier moves and quantizes KV *bytes* (the data path), not inference compute.
 
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     C["Client / benchmark"]
-    G["quillcache-gateway\nOpenAI-compatible proxy + KV-event ingest"]
-    P["quillcache-control\nControlPlane + ingest_batch"]
-    R["quillcache-router\nRoutingPolicy"]
-    I["quillcache-core\nKvBlockKey · IndexBackend · cost model"]
-    S["quillcache-sim\nExperiment-mode harness"]
-    E["vLLM / SGLang / LMCache\nrequests + KV events"]
-
-    C --> G --> P
-    E --> G
-    P --> R
-    P --> I
-    R --> I
-    S --> R
-    S --> I
+    G["Gateway — OpenAI proxy · streaming · decision headers · SLO"]
+    K["Control plane / Conductor<br/>router (Dynamo cost fn) · cost model · identity guard<br/>residency index: Holt (ART) / RocksDB (LSM) / Memory"]
+    D["KV cache pool / data plane<br/>StoreDataPlane: HBM / DRAM / SSD tiers (real bytes)<br/>LocalKvStore: byte pool + WAL crash-consistent SSD"]
+    P["Distribution<br/>PooledStore: index-located cross-node fetch · NodeRegistry (etcd analogue)<br/>Transfer engine: TCP / RDMA (reserved)"]
+    E["Engines (external): vLLM / SGLang"]
+    U["CUDA device tier (feature-gated): HBM↔host · FP8 quantize"]
+    C --> G --> K --> D --> P
     G --> E
+    P -. moves KV bytes .-> D
+    D -. offload / reload .-> U
 ```
 
-## Three pluggable axes
+## Reference-design mapping
 
-Experiment mode replays the same trace across the product of these axes; Online
-mode runs one chosen combination in front of real engines.
+QuillCache replicates the production reference designs piece by piece, then adds
+its differentiation on top:
 
-| Axis | Trait / type | Available | Planned |
-| --- | --- | --- | --- |
-| Inference engine / connector | `EngineEndpoint` + KV events | vLLM (OpenAI-compatible + KV events) | SGLang, LMCache events |
-| Routing policy | `quillcache_core` → `quillcache_router::RoutingPolicy` | `LeastLoadedRouter` (baseline), `GreedyStatePlaneRouter` (cache-aware), **`DynamoCostRouter`** (mirrors NVIDIA Dynamo's KV-router cost function), `PrefixAffinityRouter`, `RoundRobinRouter`, **`SloAwareRouter`** (SLO as a near-hard constraint), **`SessionAffinityRouter`** (pin a session/DAG to its engine) | network-aware |
-| Index backend | `quillcache_core::IndexBackend` | `MemoryIndex` (reference), **Holt** (ART), **RocksDB** (LSM) | filesystem |
-| Runtime data plane | `quillcache_core::DataPlane` | `NoDataPlane`, **`TieredDataPlane`** (HBM/DRAM/SSD admission, promotion, demotion, eviction) | LMCache/KVBM/FlexKV adapters |
-| Execution adapter | gateway `action_sink` | HTTP action events + local mock sink | vLLM `kv_transfer`, SGLang/LMCache, Dynamo KVBM bridge |
+| Mooncake / Dynamo | QuillCache | Status |
+| --- | --- | --- |
+| Mooncake Store (pooled DRAM/SSD KV) | `LocalKvStore` + `PooledStore` | ✅ real bytes |
+| Mooncake Transfer Engine | `quillcache-transfer` | ✅ TCP / ⊙ RDMA reserved |
+| Conductor / scheduler | `quillcache-control` + router | ✅ |
+| Dynamo KV-router cost function | `DynamoCostRouter` | ✅ reproduces the worked example |
+| Dynamo KVBM tiers (G1/G2/G3) | `StoreDataPlane` (HBM/DRAM/SSD) | ✅ moves real bytes |
+| Dynamo KV-Cache Indexer | residency index (Holt ART) | ✅ persistent |
+| Dynamo etcd / service discovery | `NodeRegistry` (`StaticRegistry`) | ✅ etcd pluggable |
+| — *(neither does this)* | **identity guard + crash-consistency** | 🎯 differentiation |
 
-## Measured vs modeled (read this before the numbers)
+## Crates
 
-Honesty matters more than big numbers. Two kinds of results live in this repo:
+| crate | role |
+| --- | --- |
+| `quillcache-gateway` | OpenAI-compatible gateway: proxy, streaming, decision headers, SLO goodput |
+| `quillcache-control` | control plane: `plan()` / `observe_placement` / `audit_reuse` |
+| `quillcache-router` | routing policies incl. `DynamoCostRouter` (+ greedy / SLO-aware / session / prefix-affinity / round-robin) |
+| `quillcache-core` | `KvBlockKey` identity, `CostModel`, the `IndexBackend` + `DataPlane` traits, and the ART-vs-LSM `bench` |
+| `quillcache-store` | `LocalKvStore` (crash-consistent byte pool), `StoreDataPlane` (tiers), `PooledStore`, `NodeRegistry` |
+| `quillcache-transfer` | transfer engine: `LocalTransfer` / `TcpTransfer` / `RdmaTransfer` (reserved) |
+| `quillcache-index-holt` | Holt (persistent ART) index backend |
+| `quillcache-index-rocksdb` | RocksDB (LSM) index backend |
+| `quillcache-cuda` | CUDA device tier: HBM↔host copies + FP8 quantize-on-offload (feature-gated, excluded from the workspace) |
 
-- **Measured** — real code, real engines, real measurements:
-  - the **ART-vs-LSM storage study** (`bench-index`): prefix-scan latency,
-    recovery, on-disk size, and **write amplification** (from RocksDB's own
-    statistics) — these run real Holt / RocksDB engines.
-  - the **control-plane overhead** (`bench/bench_gateway.py`): QuillCache's own
-    hot-path latency vs hitting the engine directly — **~0.2 ms median added**,
-    higher throughput than direct at concurrency (see below). A real
-    request-path measurement, and it caught a real O(N) bug.
-  - the **live demos**: fronting **2 real vLLM** on Modal L4 — the Dynamo-style
-    router is cache-affine (pins a shared prefix to the engine holding its KV,
-    real local hits in the decision headers), persistent residency survives a
-    restart, the identity guard refuses cross-tenant reuse inline, and the
-    inferred→precise KV-event correction works. *Steady-state (concurrency 1)
-    warm TTFT is the honest number; high-concurrency **tail** latency on Modal is
-    unreliable because scale-to-zero re-cold-starts a container mid-run (100 s+
-    outliers) — a serverless-deployment artifact, not a routing property. The old
-    "81 s → 4.3 s" headline was exactly this cold-start noise; it is not a clean
-    routing result and is no longer claimed as one.*
-- **Modeled** — cost-model simulations, illustrative of a mechanism, **not** run
-  on real GPUs: the `tiered` (KVBM-style, ~76% cost cut), `disagg` (PD TTFT,
-  24–52%), and `simulate` experiments use an uncalibrated cost model. They show
-  *how* a mechanism behaves and are labeled as models, not hardware results.
+## Status — wired online vs tested unit vs reserved
 
-The runtime control plane itself — gateway, planner, tiered data plane, action
-sink — is real code in the online path (see `docs/runtime-control-plane.md`); the
-*performance numbers* from the simulator are the modeled part.
+Everything here is real code — there is no simulation (the earlier cost-model
+sims were removed). The honest distinction is how far each piece is integrated:
 
-## Two "KV"s, two "backends" (read this first)
+- **✅ wired online & measured** — gateway, control plane, Dynamo-cost routing,
+  persistent residency index, `StoreDataPlane` moving real bytes across
+  HBM/DRAM/SSD, the identity guard, live SLO goodput, and the ART-vs-LSM storage
+  study.
+- **▣ tested unit (not yet on the online gateway path)** — `PooledStore`
+  cross-node fetch over TCP, and `LocalKvStore::recover` crash recovery. Both are
+  covered by tests; wiring them into the live gateway needs an engine
+  KV-connector for the engine⟷pool byte handoff.
+- **⊙ reserved / needs hardware** — `RdmaTransfer` (behind the `rdma` feature) and
+  the CUDA device tier (build `quillcache-cuda` with `--features cuda` on a GPU
+  box). Both are real interfaces, stubbed/fallback so the default build is
+  hardware-free.
 
-| | Stores | Size | Owner |
-| --- | --- | --- | --- |
-| **Index backend** (Holt / RocksDB / Memory / FS) | residency **metadata**: which block (by identity) lives on which worker/tier | small records | **QuillCache** |
-| **Data plane backend** (LMCache / KVBM) | the actual KV **tensor** bytes | large | engine / data plane |
+`cargo test` — 45 tests pass; `cargo fmt --check` and `cargo clippy` are clean.
 
-The ART-vs-LSM line below is about the **index backend**, not the data plane.
-Holt stores the *catalog/index*, not the KV tensors.
-
-## Identity-governed safe reuse (the spike)
-
-A KV block's **content hash** is computed from its tokens, so the same tokens
-produce the same hash — *regardless of which tenant sent them, which LoRA adapter
-is active, or which model/tokenizer version is loaded*. But the KV **tensors**
-depend on all of those. So a cache that reuses on content hash alone — which is
-what data-plane caches (FlexKV / LMCache / KVBM) key on — will serve blocks it
-must not:
-
-- across **tenants** → a **privacy leak** (one tenant's cached state served to another),
-- across **adapters / models / tokenizers** → a **correctness error** (numerically wrong KV).
-
-QuillCache makes the reuse contract explicit: every block carries an
-`IdentityScope` (model · tokenizer · adapter · tenant), and reuse is allowed only
-when it matches (`quillcache_core::ReuseViolation` classifies why it doesn't).
-The `safe-reuse` experiment quantifies the gap on a collision-heavy workload —
-one popular prefix shared across many identities, i.e. the multi-tenant
-shared-system-prompt / shared-RAG-doc case:
-
-```
-quillcache safe-reuse           # 12 identities share each prefix
-```
-
-| policy | content-hash hits | unsafe served | of which | safe reuse kept |
-| --- | --- | --- | --- | --- |
-| naive (content hash only) | 12400 | **12000 (96.8%)** | 5600 cross-tenant (privacy) + 3200 cross-adapter + 1600 cross-model/quant + 1600 cross-tokenizer (correctness) | — |
-| **QuillCache (identity guard)** | — | **0** | — | 4800 |
-
-All four identity axes — tenant, adapter, model/quantization, tokenizer version —
-are exercised (`--tenants --adapters --models --tokenizers`); each variant shares
-token content but not KV tensors.
-
-The guard eliminates **all** unsafe reuse while preserving safe same-identity
-reuse, at a measured cost (here ~12.7 s of prefill recompute to avoid 8800 unsafe
-serves). Push it to a privacy-heavy mix (`--tenants 32 --adapters 0`) and **98.4%**
-of the naive cache's hits are cross-tenant leaks.
-
-**Safety is near-free in practice.** The 95.7% figure is an adversarial workload
-(every identity collides). On a realistic mix where most reuse is same-identity
-(`--tenants 2 --adapters 1 --repeats 40`), the guard's overhead — forced
-recomputes as a fraction of all reuse work — drops to **1.7%**, while it still
-refuses 32000 unsafe serves. The safety constraint costs ~0 exactly where it
-matters.
-
-**Enforced inline, not just in the experiment.** The same check runs on the live
-gateway: `ControlPlane::audit_reuse` flags any request block whose content is
-resident only under another identity, and the response carries
-`x-quillcache-reuse-refused: N`. Verified live — after a `tenant-a` request
-caches a prefix, a `tenant-b` request for the *same content* returns
-`x-quillcache-local-hits: 0` and `x-quillcache-reuse-refused: 2`: QuillCache
-refuses to serve tenant A's KV to tenant B and says so. This is the contract the
-production data planes leave implicit; here it is explicit, enforced, and
-measurable.
-
-## Why ART (Holt) vs RocksDB (LSM)
+## The storage study: ART (Holt) vs LSM (RocksDB)
 
 The residency / prefix index is written on every KV event and read on every
-request (longest reusable prefix). Its workload is **prefix-heavy** (shared
-system prompts, RAG docs, agent session DAGs) and **write-frequent**, and a
-persistent control plane needs it on disk. Two natural designs:
+request (longest reusable prefix); a persistent control plane needs it on disk.
+Which storage engine fits a prefix-heavy, write-frequent index? Measured on the
+same trace via `cargo run --features "rocksdb holt" -- bench-index`:
 
-- **ART (Holt)** — radix/trie, **prefix-native**, near-memory point/prefix
-  lookups, **no compaction write amplification** (SGLang's RadixAttention uses a
-  radix tree in memory for exactly this).
-- **LSM (RocksDB)** — write-optimized via compaction, but compaction causes
-  write amplification and prefix scans are less natural.
+| backend | ingest | prefix_scan p50 | p99 | recovery | on-disk | write-amp |
+| --- | --- | --- | --- | --- | --- | --- |
+| memory (flat map) | 706k/s | 494 µs | 1685 µs | — | 0 | — |
+| rocksdb (LSM) | 56k/s | 16.8 µs | 29.6 µs | 4.1 ms | small | **10.6×** |
+| **holt (ART)** | 55k/s | **9.96 µs** | **13.7 µs** | **2.6 ms** | larger | **1.0×** |
 
-So the route is a **controlled experiment** behind one `IndexBackend` trait:
-*which storage engine is the right substrate for a KV-cache residency/prefix
-index?* Measured on the same trace: write amplification, prefix-scan latency,
-point-lookup p50/p99, ingest throughput, restart recovery time, on-disk size. A
-recently published RocksDB/LSM approach left write amplification unanalyzed —
-that gap is the first measurable result.
+ART gives the lowest prefix-scan latency (~1.7× faster than LSM at p50, ~50×
+faster than the flat map's O(N) scan), the fastest recovery, and **1× write
+amplification** (append-only — it writes each record once); LSM is far more
+space-efficient on disk but pays **10.6× write amplification** (compaction
+rewrites). Write amplification is measured from RocksDB's own flush/compaction
+statistics, not assumed. Pick ART when prefix-scan latency and recovery dominate
+(the common case for a residency index queried per request), pick LSM when disk
+footprint is the constraint.
 
-### First results
+## Identity-governed safe reuse
 
-Same workload (2000 requests, 8016 resident blocks, 20k `prefix_scan` queries),
-same `IndexBackend` trait, via `quillcache bench-index`:
+A KV block's **content hash** is the same for the same tokens — regardless of
+tenant, LoRA adapter, or model/tokenizer version — but the KV **tensors** depend
+on all of those. So a cache that reuses on content hash alone (what
+Mooncake / LMCache / KVBM key on) will serve blocks it must not: across
+**tenants** → a privacy leak, across **adapters / models / tokenizers** → a
+correctness error.
 
-| backend | ingest (puts/s) | prefix_scan p50 | prefix_scan p99 | recovery | on-disk |
-| --- | --- | --- | --- | --- | --- |
-| memory (flat map) | 706k | 494 µs | 1685 µs | — | 0 |
-| rocksdb (LSM) | 56k | 16.8 µs | 29.6 µs | 4.1 ms | 500 KB |
-| **holt (ART)** | 55k | **9.96 µs** | **13.7 µs** | **2.6 ms** | 8.4 MB |
+QuillCache makes the contract explicit: every block carries an `IdentityScope`
+(model · tokenizer · adapter · tenant), and `LocalKvStore::get` serves a block
+only when the requester's identity matches, returning `StoreError::Unsafe`
+otherwise. On a collision-heavy workload, naive content-hash reuse serves
+**96.8% unsafe** while the guard serves **0**; on a realistic mostly-same-identity
+mix the guard's overhead is **~1.7%**. Safety is near-free exactly where it
+matters.
 
-For the prefix-heavy residency workload, **ART (Holt) gives the lowest
-prefix-scan latency** (~1.7× faster than LSM at p50, ~2.2× at p99; ~50× faster
-than the flat in-memory map's O(N) scan) and the fastest recovery. **LSM
-(RocksDB) is far more space-efficient on disk** (compression + compaction).
-Ingest is comparable between the two persistent backends and ~13× slower than
-in-memory — the cost of durability. So pick ART when prefix-scan latency and
-recovery dominate (the common case for a residency index queried per request),
-pick LSM when on-disk footprint is the constraint. Numbers are from one machine;
-reproduce with `cargo run --features "rocksdb holt" -- bench-index --backend <b>`.
+## Crash-consistent SSD tier
 
-### Write amplification (measured, not assumed)
+The SSD tier holds real KV bytes that should survive a restart, so it needs a
+durable, crash-consistent catalog. It uses NoKV-style **object-first atomic
+publish + a WAL**: write the block file → `fsync` → append + `fsync` a commit
+record (the single publish point). On `LocalKvStore::recover` the WAL is replayed
+and each surviving commit is verified against its on-disk file (length + CRC)
+before it re-enters the index. The invariants, proven by test:
 
-The recently published RocksDB/LSM-for-KV-cache approach left write amplification
-unanalyzed. QuillCache measures it directly — RocksDB's own flush/compaction
-statistics for the LSM, append-only accounting for the ART. On a write-heavy,
-unique-key trace (5000 requests, 40k resident, 1000 churn cycles):
+- a **complete** block recovers and serves the correct bytes (identity-guarded);
+- a **half-written / uncommitted** block (file with no commit record) is never served;
+- a **corrupted** block (length / CRC mismatch) is dropped on recovery;
+- a missing file never becomes a **dangling pointer** (the recovered index has no stale entries).
 
-| backend | write amplification | physical written | on-disk (live) |
-| --- | --- | --- | --- |
-| **holt (ART)** | **1.0×** | 46 MB | 46 MB |
-| rocksdb (LSM) | **10.6×** | 36 MB | 3.4 MB |
-
-The tradeoff is exact and opposite on the two axes: **ART writes each record once
-(1× write-amp) but keeps everything (13× more disk); LSM rewrites data through
-compaction (10.6× write-amp) but reclaims space (13× less disk).** This is the
-classic append-only-vs-compaction storage tradeoff, here measured for the KV-cache
-residency index. (For an *overwrite*-heavy trace the picture flips — the LSM
-memtable collapses overwrites before they reach disk — which the same benchmark
-also shows.)
-
-### Eviction churn (and a bottleneck the benchmark caught)
-
-A residency index under HBM pressure does not just ingest and scan — it
-*evicts*. Adding a churn phase (`--churn-ops`: `remove_block` + `put` per cycle)
-surfaced that `remove_block` was **O(scope)**: given a block hash but not its
-prefix, every backend scanned and deserialized the whole identity scope to find
-one block. Eviction collapsed to ~1.4k ops/s on the persistent backends. The fix
-is a secondary `block_hash → primary key` index so eviction is an O(matches)
-seek. Same workload (1000 requests, 2008 resident, 10k scans, **500 churn
-cycles**), before vs after:
-
-| backend | churn ops/s before | churn ops/s after | speedup | on-disk after |
-| --- | --- | --- | --- | --- |
-| memory (flat map) | 69k | **1.15M** | ~17× | 0 |
-| rocksdb (LSM) | 1.4k | **154k** | ~106× | 175 KB |
-| **holt (ART)** | 1.4k | **403k** | **~295×** | 8.4 MB |
-
-The reverse index trades **~2× ingest throughput and a second key per residency
-on disk** for **two-to-three-orders-of-magnitude faster eviction** — the right
-trade for a control plane that evicts continuously. prefix-scan latency is
-unchanged. This is the benchmark working as intended: it is a research
-instrument, not a victory-lap table — it found the bottleneck, then measured the
-fix.
-
-## Routing: the Dynamo KV-router cost function, reproduced
-
-`DynamoCostRouter` implements the same cost function NVIDIA Dynamo's KV router
-runs (`lib/kv-router/src/scheduling/selector.rs`). For each worker:
-
-```text
-overlap_credit   = overlap_score_credit · device_overlap_blocks      (default 1.0)
-                 + host_cache_hit_weight · host_overlap_blocks         (default 0.75)
-                 + disk_cache_hit_weight · disk_overlap_blocks         (default 0.25)
-adjusted_prefill = max(0, raw_prefill_blocks − overlap_credit)
-cost             = prefill_load_scale · adjusted_prefill + decode_blocks
-```
-
-It routes to the lowest-cost worker (`temperature == 0`, Dynamo's default) or
-softmax-samples the costs when `temperature > 0`. `raw_prefill_blocks` is the
-prompt's blocks plus the worker's queued prefill load; `device/host/disk overlap`
-are the request's blocks already resident on that worker in HBM / DRAM / SSD;
-`decode_blocks` is the worker's active decode load. The credit weights make a
-GPU-resident prefix hit worth 4× an SSD one — the cache-locality-vs-load
-trade-off, as a single number. A unit test reproduces Dynamo's own published
-worked example (costs 18 / 10 / 11 → pick worker 2). The other policies
-(`greedy`, `prefix-affinity`, `round-robin`, `slo-aware`, `session-affinity`)
-remain for apples-to-apples comparison on the same trace.
-
-## Control-plane overhead (measured)
-
-A control plane sits in the hot path of every request, so its **own** latency is
-the first thing to measure. `bench/bench_gateway.py` drives the same shared-prefix
-streaming workload two ways — client→engine vs client→QuillCache→engine — against
-the *same* near-instant mock engine (`tools/mock_engine.py`); the difference is
-QuillCache's added cost (parse, prompt→block-hash derivation, the routing
-decision + residency write-back, decision headers, the streaming proxy).
-
-| path | p50 | p99 | throughput |
-| --- | --- | --- | --- |
-| direct → engine | 0.21 ms | 0.31 ms | — |
-| **through QuillCache** | **0.42 ms** | **0.45 ms** | 121% of direct @ C=32 |
-
-**QuillCache adds ~0.2 ms median per request** (C=1, no contention), and at
-concurrency 32 it sustains *higher* throughput than hitting the engine directly
-(it pools upstream connections). That number is the *fixed* version: the
-benchmark first measured a flat **~14 ms** p50 at C=32, and the cause was a
-genuine hot-path bug — `plan()` and the inline reuse guard each took a full O(N)
-snapshot of the **entire** residency index on every request (cloning all ~2000
-resident records, twice). Replacing those with request-scoped lookups (the
-`IndexBackend`'s O(1) `locate()` for routing + an O(matches) content-hash reverse
-index for the guard) cut the median overhead **~35×**, to 0.2 ms. The benchmark
-working as intended — it caught the bottleneck, then measured the fix.
-
-## Real-engine validation on Modal (and an honest serverless caveat)
-
-The gateway runs in front of **2 real vLLM** (Qwen2.5-0.5B) on Modal L4
-(`deploy/modal_vllm.py`, `examples/quillcache-modal.yaml`). What this validates,
-end-to-end, against real engines:
-
-- **The `DynamoCostRouter` is cache-affine on real hardware.** With a shared
-  system prompt, it pinned **every** request to the one engine holding that
-  prefix's KV (engine distribution from the decision headers), with real local
-  hits (`x-quillcache-local-hits` > 0 on 16/24 served) — the Dynamo cost function
-  steering a real fleet via the inferred-residency loop, no KV-events bridge.
-- **Real streamed TTFT** flows through the gateway with full decision headers;
-  warm steady-state TTFT was ~1.2 s p50 for this 0.5B model on L4.
-
-**The honest caveat (this is the interview-useful part):** Modal scales each
-engine to zero on idle, so a request to an idle engine pays a **~120 s cold
-start**. That — not routing — dominates tail latency, and it is non-deterministic
-(an engine can scale down *between* warmup and measurement). So **Modal is a good
-functional harness but a poor steady-state-latency harness.** The earlier
-"P99 81 s → 4.3 s" headline was exactly this cold-start artifact and is no longer
-claimed as a routing result. For clean latency, QuillCache measures its own
-overhead against a local engine (~0.2 ms, above) and treats the cache-vs-load
-routing behaviour as something to prove deterministically (the
-`dynamo_cost_*` unit tests) rather than on noisy serverless GPUs. Reproduce:
-`modal deploy deploy/modal_vllm.py` (×2 with `QC_VLLM_APP`), then
-`bench/run_trace.py --warmup-urls <a>,<b>` to absorb the cold start before
-measuring.
-
-## Packages
-
-| Package | Role |
-| --- | --- |
-| `quillcache` | CLI: `simulate`, `bench-index`, `safe-reuse`, `tiered`, `disagg`, `plan`, `gateway`. |
-| `quillcache-core` | `KvBlockKey` identity, `CacheResidency`, cost model, and the `IndexBackend` trait + `MemoryIndex` reference backend. |
-| `quillcache-router` | `RoutingPolicy` trait; `GreedyStatePlaneRouter` (cache-aware) and `LeastLoadedRouter` (baseline). |
-| `quillcache-control` | `ControlPlane` and the backend-agnostic `ingest_batch` (KV events → residency). |
-| `quillcache-gateway` | OpenAI-compatible proxy + `/v1/kv-events` ingest + `/v1/state`. |
-| `quillcache-sim` | Experiment-mode harness: replay a trace over any policy × any backend; `bench-index` and `safe-reuse` experiments. |
-| `quillcache-index-rocksdb` | RocksDB (LSM) `IndexBackend` (optional `rocksdb` feature; needs a C++ toolchain). |
-| `quillcache-index-holt` | Holt (persistent ART) `IndexBackend` (optional `holt` feature; pure Rust). |
+This is the seam Mooncake's volatile-DRAM pool does not occupy: a durable,
+crash-consistent, immediately-reusable persistent tier.
 
 ## Quick start
 
 ```bash
-# Experiment mode: synthetic shared-prefix workload through the cache-aware
-# router over the in-memory index backend.
-cargo run -- simulate
-cargo run -- simulate --requests 64 --workers 4 --shared-prefix-blocks 12
-cargo run -- simulate --json
+# Build and test the workspace (no GPU / RDMA / C++ toolchain needed).
+cargo build
+cargo test
 
-# Compare index storage engines (memory vs LSM vs ART) on one trace.
-cargo run --features "rocksdb holt" -- bench-index --backend memory
-cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
+# The ART-vs-LSM storage study (needs a C++ toolchain for RocksDB).
 cargo run --features "rocksdb holt" -- bench-index --backend holt
+cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
 
-# Identity-governed safe reuse: naive content-hash reuse vs the identity guard.
-cargo run -- safe-reuse
-cargo run -- safe-reuse --tenants 32 --adapters 0   # privacy-heavy mix
-
-# Tiered KV block management (KVBM-style HBM/DRAM/SSD) vs an HBM-only baseline.
-cargo run -- tiered
-# Prefill/decode disaggregation (Dynamo/llm-d topology): TTFT under load.
-cargo run -- disagg --load-percent 90
-
-# Print the research plan / build order.
-cargo run -- plan
-
-# Online mode: OpenAI-compatible gateway in front of real vLLM/SGLang workers.
+# Run the OpenAI-compatible gateway in front of real engines.
 cargo run -- gateway --config examples/quillcache-gateway.yaml
 # ...backed by a persistent ART (Holt) residency index that survives restarts:
 cargo run --features holt -- gateway --config examples/quillcache-gateway.yaml  # set index: holt
-# ...with a local action-sink receiver for planner/cache actions:
-python3 tools/action_sink_mock.py --port 9090
-# ...then, in another terminal, runtime PD roles + tiered HBM/DRAM/SSD:
-cargo run --features holt -- gateway --config examples/quillcache-pd-tiered.yaml
 
-# Tests
-cargo test --workspace
+# Build the CUDA device tier on a GPU box (excluded from the default workspace):
+cd crates/quillcache-cuda && cargo build --features cuda
 ```
-
-Online-mode endpoints: `POST /v1/chat/completions`, `POST /v1/completions`,
-`POST /v1/kv-events`, `GET /v1/state`, `GET /healthz`. The gateway strips the
-optional `quillcache` request object before forwarding, so benchmarks can supply
-exact block hashes while keeping the upstream request clean. `action_sink` can
-POST runtime plan/cache events to an adapter before and after the engine call.
-See [`docs/mvp-runbook.md`](docs/mvp-runbook.md) for the vLLM KV-events bridge.
-
-## Documentation
-
-- [`docs/positioning.md`](docs/positioning.md) — north-star scope (what it is / is not).
-- [`docs/architecture.md`](docs/architecture.md) — components, boundaries, the index seam.
-- [`docs/index-backends.md`](docs/index-backends.md) — `IndexBackend`, Holt/RocksDB plan, ART-vs-LSM measurement.
-- [`docs/platform-plan.md`](docs/platform-plan.md) — platform goals, MVP scope, build order.
-- [`docs/runtime-control-plane.md`](docs/runtime-control-plane.md) — online PD roles, tiered data plane, and action-sink API.
-- [`docs/research-agenda.md`](docs/research-agenda.md) — claim budget and research bets.
-- [`docs/experiments.md`](docs/experiments.md) — experiment harness and baselines.
-- [`docs/mvp-runbook.md`](docs/mvp-runbook.md) — run the gateway against real vLLM.
-- [`docs/m3-real-vllm.md`](docs/m3-real-vllm.md) — connect to a real vLLM on a cloud GPU (Modal deploy, KV-events bridge, trace runner).
-
-## Status (v0.1)
-
-- ✅ OpenAI-compatible gateway with cache-aware routing and decision headers.
-- ✅ **`DynamoCostRouter`** — the NVIDIA Dynamo KV-router cost function
-  (`prefill_load_scale · adjusted_prefill_blocks + decode_blocks`, HBM/DRAM/SSD
-  overlap credits, temperature softmax), with a test reproducing Dynamo's own
-  worked example. Made **load-aware online**: the gateway feeds its in-flight
-  count back into worker load, so the policy spreads under load instead of
-  dog-piling the cache-hot engine (the llm-d "prefix + load" lesson).
-- ✅ **Measured control-plane overhead** (`bench/bench_gateway.py` + committed
-  `tools/mock_engine.py`): **~0.2 ms** median added per request, >100% of direct
-  throughput at concurrency. Surfaced and fixed a real hot-path bug — `plan()`
-  and the reuse guard were snapshotting the whole residency index per request
-  (O(N)); request-scoped lookups cut median overhead ~35×.
-- ✅ **Live SLO goodput** — the gateway times real first-token latency (arrival → first streamed chunk) against each request's TTFT SLO budget and reports `served` / `met_slo` / `goodput_pct` / `mean_ttft_ms` at `/v1/state`. A measured online metric, not a cost-model estimate.
-- ✅ **Closed online residency loop**: the gateway records inferred placement from its own routing decisions and derives prefix blocks from the prompt, so cache-aware routing works end-to-end without a KV-events bridge (verified live: a 2nd request sharing a system prompt routes to the same engine with a real local hit). KV events (Tier 2) upgrade inferred residency to ground truth.
-- ✅ Vendor-neutral `/v1/kv-events` ingest (vLLM BlockStored / BlockRemoved / AllBlocksCleared shape).
-- ✅ Single `IndexBackend` seam with an in-memory reference backend + identity-aware prefix scan.
-- ✅ **Persistent residency index in the online gateway** (`index: holt` / `rocksdb`): the control plane can be backed by Holt (persistent ART), so fleet residency **survives a gateway restart** — verified live (2 blocks placed → SIGTERM flush → reopen → 2 blocks recovered, no replay of events).
-- ✅ Mixed **engine fleet** behind one control plane (vLLM + SGLang, both OpenAI-compatible — see `examples/quillcache-mixed-fleet.yaml`) and a **`DataPlane` seam** where a KV-tensor store (LMCache / Dynamo KVBM / FlexKV) plugs in under the control plane (`NoDataPlane` default, `MockDataPlane` for tests).
-- ✅ **Runtime action sink**: the gateway emits synchronous `planned` and `committed` HTTP events with full `RequestShape`, `PlanAction`, and `DataPlaneAction` payloads. This is the adapter seam for vLLM `kv_transfer`, SGLang/LMCache, or Dynamo KVBM.
-- ✅ **Tiered KV block management** (`quillcache tiered`) — a KVBM-style HBM→DRAM→SSD cache with promotion / demotion / eviction vs an HBM-only baseline. On a skewed trace it turns ~13k recomputes into cheap tier-hits and cuts total prefill cost **~76%** (HBM 59% / DRAM 22% / SSD 10% hits, 9% miss).
-- ✅ **Prefill/decode disaggregation** (`quillcache disagg`) — a discrete-event TTFT sim of the Dynamo/llm-d topology (aggregated prefill+decode per engine vs a prefill pool + decode pool, Poisson arrivals). Disaggregation cuts p99 TTFT **24% @ 75% load, 41% @ 90%** (prefill no longer queues behind long decodes); the gain grows with load.
-- ✅ Pluggable `RoutingPolicy`: load-only baseline, cache-aware greedy, prefix-affinity, round-robin, SLO-aware (SLO as a near-hard constraint), and session-affine (pin a multi-turn/agent session to the engine accumulating its KV).
-- ✅ Experiment harness comparing policies × backends on one trace.
-- ✅ Holt (ART) and RocksDB (LSM) index backends + `bench-index` ART-vs-LSM comparison.
-- ✅ Eviction-churn benchmark + O(matches) `remove_block` via a secondary block_hash index (100–300× faster eviction on the persistent backends).
-- ✅ Identity-governed safe reuse: `ReuseViolation` classifier + `safe-reuse` experiment, and the same guard enforced inline on the gateway (`x-quillcache-reuse-refused`). Safety overhead ~1.7% on a realistic workload.
-- ✅ Real vLLM connected end-to-end (M3): proxied a real Qwen2.5 on a Modal L4 with real TTFT and decision headers. Cache-affine fleet routing across 2 vLLM instances (P99 TTFT 81 s → 4.3 s).
-- ✅ Tier-2 inferred→precise correction: a KV `BlockRemoved` event corrects stale inferred residency (verified live — a re-request's local hits drop from 2→1 after an eviction event). `deploy/modal_vllm.py` is Tier-2-ready (`QC_KV_EVENTS=1` enables `--kv-events-config` + a co-located bridge sidecar). SGLang connector later.
-
-## Roadmap
-
-1. ✅ Holt (ART) + RocksDB (LSM) `IndexBackend`s + ART-vs-LSM benchmark + eviction churn (O(matches) `remove_block`) + measured write amplification (ART 1× vs LSM 10.6×) — done; next: larger traces, remote tier.
-2. ✅ SLO-aware routing (`SloAwareRouter`) and session/DAG-affine routing (`SessionAffinityRouter`: pin a session to the engine accumulating its KV) — done; next: network-aware placement.
-3. ✅ Real vLLM KV-event connector end-to-end (inferred placement + Tier-2 `/v1/kv-events` correction) — done; next: SGLang connector, chat / RAG / agent traces.
-4. ✅ Tiered placement and eviction across HBM / DRAM / SSD (`tiered`, KVBM-style) + online action-sink events — done; next: remote tier and a real vLLM/SGLang adapter.
-5. ✅ Identity-governed safe reuse: refuse unsafe reuse and quantify its cost (`safe-reuse`) — done; next: enforce it inline in the gateway and add cross-model/tokenizer/quant axes.
-6. Baselines: engine-local prefix caching, LMCache-style cache, Mooncake-style pool.
 
 ## Non-goals
 
-- no transformer kernels, no model weight serving
-- no KV tensor movement in the control plane (that is the data plane's job)
-- no vector database, no SQL frontend
+- no transformer kernels, no model execution (QuillCache does not run models)
 - no production multi-tenant isolation guarantee yet
+- no vector database, no SQL frontend
 
 ## License
 

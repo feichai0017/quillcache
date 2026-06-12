@@ -11,3 +11,6 @@ quillcache-core = { path = "../quillcache-core", version = "1.0.0-alpha.1" }
 quillcache-router = { path = "../quillcache-router", version = "1.0.0-alpha.1" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+quillcache-store = { path = "../quillcache-store", version = "1.0.0-alpha.1" }

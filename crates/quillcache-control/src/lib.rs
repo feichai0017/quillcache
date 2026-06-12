@@ -962,9 +962,9 @@ mod tests {
 
     #[test]
     fn tiered_data_plane_updates_runtime_residency() {
-        use quillcache_core::{TieredDataPlane, TieredDataPlaneConfig};
+        use quillcache_store::{StoreDataPlane, StoreTierConfig};
         let mut control = ControlPlane::new(vec![engine()]).with_data_plane(Box::new(
-            TieredDataPlane::new(TieredDataPlaneConfig {
+            StoreDataPlane::new(StoreTierConfig {
                 hbm_capacity_bytes: 100,
                 cpu_dram_capacity_bytes: 100,
                 local_ssd_capacity_bytes: 100,
