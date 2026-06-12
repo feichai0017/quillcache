@@ -629,6 +629,68 @@ impl PooledStore {
 }
 
 // =====================================================================
+// EngineConnector — the engine <-> pool byte handoff (the KV connector seam).
+// =====================================================================
+
+/// The seam where an inference engine offloads its KV to the pool and reloads
+/// it. A real vLLM / SGLang connector hooks the engine's KV-transfer API; this
+/// in-process connector drives a [`PooledStore`] directly so the offload/reload
+/// path is end-to-end testable without a GPU. `offload` lands a freshly-computed
+/// block in the local pool and returns the residency to report to the master;
+/// `reload` serves a block from the pool — local first, else fetched from the
+/// peer node the residency index located — identity-guarded.
+#[derive(Debug)]
+pub struct EngineConnector {
+    pool: PooledStore,
+    node_id: String,
+}
+
+impl EngineConnector {
+    pub fn new(node_id: impl Into<String>, pool: PooledStore) -> Self {
+        Self {
+            pool,
+            node_id: node_id.into(),
+        }
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// The engine computed a block's KV; offload its bytes into the local pool.
+    /// Returns the [`CacheResidency`] to report to the master so peers can find
+    /// it (the block lives in this node's DRAM tier of the pool).
+    pub fn offload(&mut self, key: KvBlockKey, bytes: Bytes) -> std::io::Result<CacheResidency> {
+        let len = bytes.len() as u64;
+        self.pool.local_mut().put(key.clone(), bytes)?;
+        Ok(CacheResidency {
+            key,
+            worker_id: self.node_id.clone(),
+            tier: CacheTier::CpuDram,
+            bytes: len,
+            last_access_ms: 0,
+            ref_count: 0,
+            pinned: false,
+        })
+    }
+
+    /// The engine needs a block's KV. Serve it from the pool: local first, else
+    /// fetch from one of `located_nodes` (from the master's residency index) over
+    /// the transfer engine, and admit it locally. Identity-guarded.
+    pub async fn reload(
+        &mut self,
+        key: &KvBlockKey,
+        located_nodes: &[String],
+    ) -> Result<Bytes, StoreError> {
+        self.pool.get_pooled(key, located_nodes).await
+    }
+
+    pub fn pool_mut(&mut self) -> &mut PooledStore {
+        &mut self.pool
+    }
+}
+
+// =====================================================================
 // StoreDataPlane — tiered block manager (DataPlane seam), fused with bytes.
 // =====================================================================
 

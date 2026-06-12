@@ -1090,6 +1090,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quillcache-master"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "bytes",
+ "quillcache-core",
+ "quillcache-store",
+ "quillcache-transfer",
+ "tokio",
+]
+
+[[package]]
 name = "quillcache-router"
 version = "1.0.0-alpha.1"
 dependencies = [

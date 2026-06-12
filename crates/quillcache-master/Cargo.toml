@@ -1,0 +1,16 @@
+[package]
+name = "quillcache-master"
+version = "1.0.0-alpha.1"
+edition = "2021"
+description = "QuillCache master metadata service: shared residency index + node registry for the distributed KV pool"
+license = "MIT"
+repository = "https://github.com/feichai0017/quillcache"
+
+[dependencies]
+quillcache-core = { version = "1.0.0-alpha.1", path = "../quillcache-core" }
+
+[dev-dependencies]
+quillcache-store = { version = "1.0.0-alpha.1", path = "../quillcache-store" }
+quillcache-transfer = { version = "1.0.0-alpha.1", path = "../quillcache-transfer" }
+bytes = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }

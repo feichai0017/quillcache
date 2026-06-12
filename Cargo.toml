@@ -6,6 +6,7 @@ members = [
     "crates/quillcache-gateway",
     "crates/quillcache-router",
     "crates/quillcache-store",
+    "crates/quillcache-master",
     "crates/quillcache-transfer",
     "crates/quillcache-index-rocksdb",
     "crates/quillcache-index-holt",
@@ -17,6 +18,7 @@ default-members = [
     "crates/quillcache-gateway",
     "crates/quillcache-router",
     "crates/quillcache-store",
+    "crates/quillcache-master",
     "crates/quillcache-transfer",
     "crates/quillcache-index-holt",
 ]
