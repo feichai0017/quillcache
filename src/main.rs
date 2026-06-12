@@ -1,5 +1,7 @@
 mod cluster;
 mod gateway;
+mod master_http;
+mod node;
 
 use crate::gateway::run_from_config_path;
 use clap::{Parser, Subcommand};
@@ -54,6 +56,29 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         requests: usize,
     },
+    /// Run the master metadata service (shared residency index + node registry)
+    /// over HTTP, for out-of-process nodes or a real engine KV connector.
+    Master {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        addr: String,
+    },
+    /// Run a standalone pool node: a local KV byte store + a transfer server,
+    /// registered with the master. The target a real engine's KV connector
+    /// (bridge/vllm_quillcache_connector.py) offloads to and fetches from.
+    Node {
+        #[arg(long, default_value = "127.0.0.1:7001")]
+        addr: String,
+        #[arg(long, default_value = "http://127.0.0.1:7777")]
+        master: String,
+        #[arg(long, default_value = "node-1")]
+        id: String,
+        #[arg(long, default_value = "./qc-node-data")]
+        data_dir: String,
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        dram_bytes: u64,
+        #[arg(long, default_value_t = 4 * 1024 * 1024 * 1024)]
+        ssd_bytes: u64,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +95,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Gateway { config } => run_from_config_path(config).await?,
         Command::Plan => print_plan(),
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
+        Command::Master { addr } => master_http::run_master(addr).await?,
+        Command::Node {
+            addr,
+            master,
+            id,
+            data_dir,
+            dram_bytes,
+            ssd_bytes,
+        } => node::run_node(addr, master, id, data_dir, dram_bytes, ssd_bytes).await?,
         Command::BenchIndex {
             backend,
             requests,
