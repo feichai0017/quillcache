@@ -1,21 +1,27 @@
-//! The QuillCache KV block store — a Mooncake-Store-style data plane, in Rust.
+//! The QuillCache KV block store — a faithful Rust port of `mooncake-store`.
 //!
-//! Mapping to the reference designs we are replicating:
-//! - **Mooncake Store** = the pooled DRAM/SSD KV cache. Here that is
-//!   [`LocalKvStore`] (the real byte pool on one node) plus [`PooledStore`]
-//!   (local-first, else fetch a block from a peer node over the transfer engine).
-//! - **Mooncake Transfer Engine** = the data path. We depend on
-//!   `crate::transfer::Transfer` (TCP today, RDMA reserved) and serve our
-//!   blocks to peers via [`StoreBlockSource`].
-//! - **NVIDIA Dynamo KVBM** = the tiered block manager (G1 HBM / G2 host / G3
-//!   disk). Here that is [`StoreDataPlane`]: it implements the control plane's
-//!   `DataPlane` seam (HBM ↔ DRAM ↔ SSD admission / demotion / eviction) and,
-//!   now fused with [`LocalKvStore`], its `place()` moves **real bytes** between
-//!   the DRAM and SSD tiers, not just metadata.
+//! Mapping to the reference design (Mooncake `mooncake-store/`):
+//! - **`Client`** ([`DummyClient`] / [`RealClient`]) — the two-phase Put/Get API.
+//! - **`MasterService`** ([`MasterService`]) — object metadata, replica
+//!   allocation, the two-phase Put, lease-based eviction. No bytes flow through it.
+//! - **`BufferAllocator`** ([`OffsetBufferAllocator`]) + **`AllocationStrategy`**
+//!   ([`RandomAllocationStrategy`] / [`FreeRatioFirstAllocationStrategy`]).
+//! - **`Replica`** ([`Replica`], [`ReplicaData`]) — `Memory` (a mounted segment's
+//!   buffer) or `Disk` (a durable file-backed replica).
+//! - Byte movement is the `quillcache-transfer-engine` crate (segment/offset).
 //!
-//! What QuillCache adds over both: the **identity guard** — a block is served
-//! only when the requester's model · tokenizer · adapter · tenant matches.
-//! Content-hash-keyed pools (Mooncake / LMCache / KVBM) leave that implicit.
+//! What QuillCache adds over Mooncake (whose keys are identity-agnostic and whose
+//! pool is volatile DRAM):
+//! - the **identity guard** — a replica is served only when the requester's
+//!   model · tokenizer · adapter · tenant matches the writer's (woven into
+//!   [`MasterService::get_replica_list`] and [`DiskTier`]);
+//! - a **crash-consistent durable tier** ([`DiskTier`], on [`LocalKvStore`]'s WAL)
+//!   so a `Disk` replica survives a restart.
+//!
+//! Also here: [`StoreDataPlane`] (the Dynamo-KVBM-style tiered block manager that
+//! implements the control plane's `DataPlane` seam, fused with per-worker
+//! [`LocalKvStore`] byte pools), and [`serve_listener`] (the node block-serving
+//! endpoint for the real-engine connector's path B).
 
 use bytes::Bytes;
 use quillcache_core::{
@@ -29,7 +35,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
 
 pub mod transfer;
 pub use transfer::*;
@@ -547,237 +552,6 @@ impl BlockSource for StoreBlockSource {
     }
 }
 
-/// Resolves a node id to its transfer-engine address. This is Dynamo's
-/// service-discovery role (etcd in production); [`StaticRegistry`] is the
-/// in-memory dev backend, and an etcd-backed registry plugs in behind this trait
-/// without touching the pooled read path.
-pub trait NodeRegistry: Send + Sync + std::fmt::Debug {
-    /// Transfer-engine address (`host:port`) for a node, if known.
-    fn addr_of(&self, node_id: &str) -> Option<String>;
-    /// The local node's id, so the pool can skip fetching from itself.
-    fn this_node(&self) -> &str;
-}
-
-/// In-memory [`NodeRegistry`] — the etcd analogue for single-process / dev runs.
-#[derive(Debug, Clone, Default)]
-pub struct StaticRegistry {
-    this_node: String,
-    addrs: HashMap<String, String>,
-}
-
-impl StaticRegistry {
-    pub fn new(this_node: impl Into<String>) -> Self {
-        Self {
-            this_node: this_node.into(),
-            addrs: HashMap::new(),
-        }
-    }
-
-    pub fn with_node(mut self, node_id: impl Into<String>, addr: impl Into<String>) -> Self {
-        self.addrs.insert(node_id.into(), addr.into());
-        self
-    }
-}
-
-impl NodeRegistry for StaticRegistry {
-    fn addr_of(&self, node_id: &str) -> Option<String> {
-        self.addrs.get(node_id).cloned()
-    }
-
-    fn this_node(&self) -> &str {
-        &self.this_node
-    }
-}
-
-/// A node's view of the distributed KV cache pool — Mooncake Store's local shard
-/// plus the cluster read path. Ties together this node's [`LocalKvStore`] (the
-/// byte pool), the transfer engine (the data path), and a [`NodeRegistry`]
-/// (node → address). [`Self::get_pooled`] is the pooled-cache read: serve
-/// locally, else fetch from a peer the residency index located, admit it
-/// locally, and return it — Conductor → metadata → Transfer Engine.
-#[derive(Debug, Clone)]
-pub struct PooledStore {
-    local: Arc<Mutex<LocalKvStore>>,
-    transfer: Arc<dyn Transfer>,
-    registry: Arc<dyn NodeRegistry>,
-    /// In-flight cross-node fetches, keyed by block. A concurrent burst of
-    /// requests that all miss locally coalesces onto ONE peer fetch (the others
-    /// wait on the broadcast) — the single-flight / cache-stampede guard.
-    in_flight: Arc<Mutex<HashMap<KvBlockKey, broadcast::Sender<Option<Bytes>>>>>,
-}
-
-impl PooledStore {
-    pub fn new(
-        local: Arc<Mutex<LocalKvStore>>,
-        transfer: Arc<dyn Transfer>,
-        registry: Arc<dyn NodeRegistry>,
-    ) -> Self {
-        Self {
-            local,
-            transfer,
-            registry,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// The shared local byte pool — clone the handle to also serve it to peers
-    /// via [`StoreBlockSource`], so one node both serves and uses one store.
-    pub fn local(&self) -> Arc<Mutex<LocalKvStore>> {
-        self.local.clone()
-    }
-
-    /// Pooled read. `located_nodes` are the node ids the residency index says
-    /// hold this block (`index.locate(key)` → worker ids). Serve locally first;
-    /// otherwise try each located peer (skipping ourselves), resolve its address
-    /// via the registry, fetch over the transfer engine, admit locally, and
-    /// return. A local cross-identity match is refused before any fetch — the
-    /// identity guard wins over a network round trip.
-    ///
-    /// Cross-node fetches are **single-flighted**: when a burst of concurrent
-    /// requests all miss this block locally, one becomes the leader and does the
-    /// peer fetch while the rest wait on its result — so a thundering herd of
-    /// cold requests for the same block triggers one network round trip, not one
-    /// per request (Mooncake/Dynamo pools need this; Go calls it `singleflight`).
-    pub async fn get_pooled(
-        &self,
-        key: &KvBlockKey,
-        located_nodes: &[String],
-    ) -> Result<Bytes, StoreError> {
-        // Serve locally first — release the lock before any `.await`.
-        let local = {
-            let mut guard = self.local.lock().unwrap();
-            guard.get(key)
-        };
-        match local {
-            Ok(bytes) => return Ok(bytes),
-            Err(StoreError::NotFound) => {}
-            // A local cross-identity match is refused before any fetch.
-            Err(other) => return Err(other),
-        }
-
-        // Single-flight admission: join an in-flight fetch for this key, or lead.
-        enum Flight {
-            Leader,
-            Follower(broadcast::Receiver<Option<Bytes>>),
-        }
-        let flight = {
-            let mut inflight = self.in_flight.lock().unwrap();
-            match inflight.get(key) {
-                Some(tx) => Flight::Follower(tx.subscribe()),
-                None => {
-                    let (tx, _rx) = broadcast::channel(1);
-                    inflight.insert(key.clone(), tx);
-                    Flight::Leader
-                }
-            }
-        };
-
-        if let Flight::Follower(mut rx) = flight {
-            // Wait for the leader and share its result; a dropped/missed leader
-            // reads as a genuine pool-wide miss.
-            return match rx.recv().await {
-                Ok(Some(bytes)) => Ok(bytes),
-                _ => Err(StoreError::NotFound),
-            };
-        }
-
-        // Leader: do the actual peer fetch, then publish to followers and clean up.
-        let result = self.fetch_from_peers(key, located_nodes).await;
-        let payload = result.as_ref().ok().cloned();
-        if let Some(tx) = self.in_flight.lock().unwrap().remove(key) {
-            let _ = tx.send(payload);
-        }
-        result
-    }
-
-    /// The peer-fetch loop: try each located node (skipping self), resolve its
-    /// address, fetch over the transfer engine, admit locally. A peer that lacks
-    /// the block (stale index) or is unreachable falls through to the next.
-    async fn fetch_from_peers(
-        &self,
-        key: &KvBlockKey,
-        located_nodes: &[String],
-    ) -> Result<Bytes, StoreError> {
-        for node in located_nodes {
-            if node == self.registry.this_node() {
-                continue;
-            }
-            let Some(addr) = self.registry.addr_of(node) else {
-                continue;
-            };
-            if let Ok(bytes) = self.transfer.read(&addr, key).await {
-                // Keyed by the exact identity-bearing key, so safe to admit.
-                let _ = self.local.lock().unwrap().put(key.clone(), bytes.clone());
-                return Ok(bytes);
-            }
-        }
-        Err(StoreError::NotFound)
-    }
-}
-
-// =====================================================================
-// EngineConnector — the engine <-> pool byte handoff (the KV connector seam).
-// =====================================================================
-
-/// The seam where an inference engine offloads its KV to the pool and reloads
-/// it. A real vLLM / SGLang connector hooks the engine's KV-transfer API; this
-/// in-process connector drives a [`PooledStore`] directly so the offload/reload
-/// path is end-to-end testable without a GPU. `offload` lands a freshly-computed
-/// block in the local pool and returns the residency to report to the master;
-/// `reload` serves a block from the pool — local first, else fetched from the
-/// peer node the residency index located — identity-guarded.
-#[derive(Debug, Clone)]
-pub struct EngineConnector {
-    pool: PooledStore,
-    node_id: String,
-}
-
-impl EngineConnector {
-    pub fn new(node_id: impl Into<String>, pool: PooledStore) -> Self {
-        Self {
-            pool,
-            node_id: node_id.into(),
-        }
-    }
-
-    pub fn node_id(&self) -> &str {
-        &self.node_id
-    }
-
-    /// The engine computed a block's KV; offload its bytes into the local pool.
-    /// Returns the [`CacheResidency`] to report to the master so peers can find
-    /// it (the block lives in this node's DRAM tier of the pool).
-    pub fn offload(&self, key: KvBlockKey, bytes: Bytes) -> std::io::Result<CacheResidency> {
-        let len = bytes.len() as u64;
-        self.pool.local().lock().unwrap().put(key.clone(), bytes)?;
-        Ok(CacheResidency {
-            key,
-            worker_id: self.node_id.clone(),
-            tier: CacheTier::CpuDram,
-            bytes: len,
-            last_access_ms: 0,
-            ref_count: 0,
-            pinned: false,
-        })
-    }
-
-    /// The engine needs a block's KV. Serve it from the pool: local first, else
-    /// fetch from one of `located_nodes` (from the master's residency index) over
-    /// the transfer engine, and admit it locally. Identity-guarded.
-    pub async fn reload(
-        &self,
-        key: &KvBlockKey,
-        located_nodes: &[String],
-    ) -> Result<Bytes, StoreError> {
-        self.pool.get_pooled(key, located_nodes).await
-    }
-
-    /// The node's shared byte pool, to serve to peers via [`StoreBlockSource`].
-    pub fn store(&self) -> Arc<Mutex<LocalKvStore>> {
-        self.pool.local()
-    }
-}
-
 // =====================================================================
 // StoreDataPlane — tiered block manager (DataPlane seam), fused with bytes.
 // =====================================================================
@@ -1250,8 +1024,6 @@ impl DataPlane for StoreDataPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer::{serve_listener, TcpTransfer};
-    use tokio::net::TcpListener;
 
     fn tmp(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -1436,122 +1208,5 @@ mod tests {
         assert_eq!(store.len(), 1); // only the intact block survived.
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn pooled_store_fetches_from_a_located_peer_over_tcp() {
-        // Node B holds a block and serves it over the transfer engine.
-        let dir_b = tmp("pool-b");
-        let store_b = Arc::new(Mutex::new(
-            LocalKvStore::new(&dir_b, 1 << 20, 1 << 20).unwrap(),
-        ));
-        store_b
-            .lock()
-            .unwrap()
-            .put(key("ten-a", "x1"), Bytes::from_static(b"remote-bytes"))
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr_b = listener.local_addr().unwrap().to_string();
-        tokio::spawn(serve_listener(
-            listener,
-            Arc::new(StoreBlockSource::new(store_b.clone())),
-        ));
-
-        // Node A: an empty local pool + a registry mapping node-b -> its address.
-        let dir_a = tmp("pool-a");
-        let local_a = LocalKvStore::new(&dir_a, 1 << 20, 1 << 20).unwrap();
-        let registry = Arc::new(StaticRegistry::new("node-a").with_node("node-b", addr_b.clone()));
-        let node_a = PooledStore::new(
-            Arc::new(Mutex::new(local_a)),
-            Arc::new(TcpTransfer),
-            registry,
-        );
-
-        // The residency index located the block on node-a (us — skipped) and
-        // node-b; node-a resolves node-b's address and fetches it over TCP.
-        let located = vec!["node-a".to_string(), "node-b".to_string()];
-        let got = node_a
-            .get_pooled(&key("ten-a", "x1"), &located)
-            .await
-            .unwrap();
-        assert_eq!(&got[..], b"remote-bytes");
-        // Now resident locally on A: a second read serves from the local pool.
-        let cached = node_a.get_pooled(&key("ten-a", "x1"), &[]).await.unwrap();
-        assert_eq!(&cached[..], b"remote-bytes");
-        // A block located only on an unknown node is a clean miss.
-        assert!(matches!(
-            node_a
-                .get_pooled(&key("ten-a", "absent"), &["node-c".to_string()])
-                .await,
-            Err(StoreError::NotFound)
-        ));
-
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
-    }
-
-    /// A peer whose fetch is slow (so concurrent followers overlap the leader's
-    /// fetch window) — wrap it in [`CountingTransfer`] to count actual fetches.
-    #[derive(Debug)]
-    struct SlowPeer {
-        data: Bytes,
-    }
-
-    #[async_trait::async_trait]
-    impl Transfer for SlowPeer {
-        fn name(&self) -> &str {
-            "slow-peer"
-        }
-        fn link_class(&self) -> LinkClass {
-            LinkClass::Tcp
-        }
-        async fn read(&self, _r: &NodeAddr, _k: &KvBlockKey) -> Result<Bytes, TransferError> {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            Ok(self.data.clone())
-        }
-        async fn write(&self, _: &NodeAddr, _: &KvBlockKey, _: Bytes) -> Result<(), TransferError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_misses_single_flight_into_one_peer_fetch() {
-        // node-a: an empty local pool whose peer fetch is slow + counted, so a
-        // burst of concurrent requests for the same block overlaps in the fetch.
-        let dir_a = tmp("sf-a");
-        let store_a = Arc::new(Mutex::new(
-            LocalKvStore::new(&dir_a, 1 << 20, 1 << 20).unwrap(),
-        ));
-        let counter = Arc::new(CountingTransfer::new(Arc::new(SlowPeer {
-            data: Bytes::from_static(b"hot-shared-prefix"),
-        })));
-        let registry = Arc::new(StaticRegistry::new("node-a").with_node("node-b", "peer:0"));
-        let node = PooledStore::new(store_a, counter.clone(), registry);
-
-        // 16 concurrent requests, all missing locally, all needing one block.
-        let located = vec!["node-b".to_string()];
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let (node, located) = (node.clone(), located.clone());
-            handles.push(tokio::spawn(async move {
-                node.get_pooled(&key("ten-a", "hot"), &located).await
-            }));
-        }
-        for h in handles {
-            assert_eq!(&h.await.unwrap().unwrap()[..], b"hot-shared-prefix");
-        }
-
-        // Single-flight collapsed 16 concurrent cold reads into ONE peer fetch.
-        assert_eq!(counter.reads(), 1);
-
-        // The block is now resident locally — a later read needs no fetch at all.
-        let cached = node
-            .get_pooled(&key("ten-a", "hot"), &located)
-            .await
-            .unwrap();
-        assert_eq!(&cached[..], b"hot-shared-prefix");
-        assert_eq!(counter.reads(), 1);
-
-        let _ = std::fs::remove_dir_all(&dir_a);
     }
 }

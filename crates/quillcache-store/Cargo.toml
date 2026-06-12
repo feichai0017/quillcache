@@ -2,24 +2,19 @@
 name = "quillcache-store"
 version = "1.0.0-alpha.1"
 edition = "2021"
-description = "Mooncake-style KV block store + transfer engine for QuillCache: real DRAM/SSD byte tiers, identity-guarded get, cross-node fetch"
+description = "Faithful Rust port of Mooncake's mooncake-store: two-phase-Put Client + MasterService + buffer allocator + replica model, with an identity guard and a crash-consistent durable tier"
 license = "MIT"
 repository = "https://github.com/feichai0017/quillcache"
 
 [dependencies]
 quillcache-core = { version = "1.0.0-alpha.1", path = "../quillcache-core" }
 quillcache-transfer-engine = { version = "1.0.0-alpha.1", path = "../quillcache-transfer-engine" }
-async-trait = "0.1"
 bytes = "1"
 crc32fast = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "sync"] }
-
-[features]
-# RDMA transfer backend (ibverbs). Reserved seam — stubbed until a NIC is available.
-rdma = []
+tokio = { workspace = true, features = ["net", "io-util"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }

@@ -1,58 +1,19 @@
-//! Transfer engine seam — move KV blocks between nodes.
+//! Node block-serving endpoint — serves a [`BlockSource`]'s KV blocks to peers
+//! over a small length-prefixed TCP protocol (read / write by key).
 //!
-//! Mooncake's transfer engine moves KV tensors over RDMA / TCP / NVLink with a
-//! pooled, zero-copy, topology-aware data path. This crate is the same seam as a
-//! Rust trait: the store depends only on `dyn Transfer`, so the wire backend is
-//! swappable without touching the data path. [`LocalTransfer`] and
-//! [`TcpTransfer`] work today on any machine; the RDMA backend (behind the
-//! `rdma` feature) is the reserved interface, stubbed until a NIC is wired —
-//! when it lands, nothing above this trait changes.
+//! This is the **server side** of the older key-oriented wire, kept only for the
+//! real-engine connector's "path B" node (`src/node.rs`, which the Python bridge
+//! in `bridge/` talks to). The faithful Mooncake transfer engine — byte movement
+//! by `(segment, offset)` between registered memory — now lives in the
+//! `quillcache-transfer-engine` crate; the client-side movers and the pooled
+//! store that used to live here were retired with the Mooncake-faithful port.
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use quillcache_core::{CacheTier, KvBlockKey};
+use quillcache_core::KvBlockKey;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-
-/// The physical link a transfer rides, so the control plane's cost model can
-/// price the path (HBM hit < NVLink < RDMA < TCP < recompute).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkClass {
-    /// Same machine, shared memory.
-    LocalShm,
-    /// Intra-node GPU↔GPU.
-    Nvlink,
-    /// Inter-node RDMA over InfiniBand.
-    RdmaIb,
-    /// Inter-node RDMA over Converged Ethernet.
-    RdmaRoce,
-    /// Inter-node TCP (the always-available fallback).
-    Tcp,
-}
-
-impl LinkClass {
-    /// The residency tier the cost model prices this link as.
-    pub fn as_tier(self) -> CacheTier {
-        match self {
-            LinkClass::LocalShm | LinkClass::Nvlink => CacheTier::RemoteHbm,
-            LinkClass::RdmaIb | LinkClass::RdmaRoce => CacheTier::RemoteHbm,
-            LinkClass::Tcp => CacheTier::CpuDram,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            LinkClass::LocalShm => "local-shm",
-            LinkClass::Nvlink => "nvlink",
-            LinkClass::RdmaIb => "rdma-ib",
-            LinkClass::RdmaRoce => "rdma-roce",
-            LinkClass::Tcp => "tcp",
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -62,8 +23,6 @@ pub enum TransferError {
     Io(String),
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("unsupported: {0}")]
-    Unsupported(&'static str),
 }
 
 impl From<std::io::Error> for TransferError {
@@ -72,193 +31,21 @@ impl From<std::io::Error> for TransferError {
     }
 }
 
-/// A node address. `host:port` for TCP; an opaque id for the in-process backend.
-pub type NodeAddr = String;
-
-/// Move a KV block's bytes to / from a remote node. Backends differ only in the
-/// wire (shared-memory, TCP, RDMA); the store sees one trait.
-#[async_trait]
-pub trait Transfer: Send + Sync + std::fmt::Debug {
-    fn name(&self) -> &str;
-    fn link_class(&self) -> LinkClass;
-    async fn read(&self, remote: &NodeAddr, key: &KvBlockKey) -> Result<Bytes, TransferError>;
-    async fn write(
-        &self,
-        remote: &NodeAddr,
-        key: &KvBlockKey,
-        data: Bytes,
-    ) -> Result<(), TransferError>;
-}
-
-/// A [`Transfer`] decorator that counts `read` calls — the actual cross-node
-/// fetches (network round trips). Wrap any backend to measure how many peer
-/// fetches single-flight coalescing avoided: under a concurrent burst for one
-/// block, `reads()` counts one fetch per node, not one per request.
-#[derive(Debug)]
-pub struct CountingTransfer {
-    inner: Arc<dyn Transfer>,
-    reads: AtomicUsize,
-}
-
-impl CountingTransfer {
-    pub fn new(inner: Arc<dyn Transfer>) -> Self {
-        Self {
-            inner,
-            reads: AtomicUsize::new(0),
-        }
-    }
-
-    /// The number of actual `read` (peer fetch) calls made through this decorator.
-    pub fn reads(&self) -> usize {
-        self.reads.load(Ordering::Relaxed)
-    }
-}
-
-#[async_trait]
-impl Transfer for CountingTransfer {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn link_class(&self) -> LinkClass {
-        self.inner.link_class()
-    }
-
-    async fn read(&self, remote: &NodeAddr, key: &KvBlockKey) -> Result<Bytes, TransferError> {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.read(remote, key).await
-    }
-
-    async fn write(
-        &self,
-        remote: &NodeAddr,
-        key: &KvBlockKey,
-        data: Bytes,
-    ) -> Result<(), TransferError> {
-        self.inner.write(remote, key, data).await
-    }
-}
-
-/// In-process transfer over a shared map. The fast path for same-machine moves
-/// and the deterministic backend for tests — no sockets, no serialization.
-#[derive(Clone, Debug, Default)]
-pub struct LocalTransfer {
-    inner: Arc<Mutex<HashMap<(NodeAddr, KvBlockKey), Bytes>>>,
-}
-
-impl LocalTransfer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl Transfer for LocalTransfer {
-    fn name(&self) -> &str {
-        "local"
-    }
-
-    fn link_class(&self) -> LinkClass {
-        LinkClass::LocalShm
-    }
-
-    async fn read(&self, remote: &NodeAddr, key: &KvBlockKey) -> Result<Bytes, TransferError> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(&(remote.clone(), key.clone()))
-            .cloned()
-            .ok_or(TransferError::NotFound)
-    }
-
-    async fn write(
-        &self,
-        remote: &NodeAddr,
-        key: &KvBlockKey,
-        data: Bytes,
-    ) -> Result<(), TransferError> {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert((remote.clone(), key.clone()), data);
-        Ok(())
-    }
-}
-
-// ---- TCP backend: a length-prefixed request/response over a plain socket ----
-
 const OP_READ: u8 = 0;
 const OP_WRITE: u8 = 1;
 const ST_OK: u8 = 0;
 const ST_NOTFOUND: u8 = 1;
 const ST_ERR: u8 = 2;
 
-/// TCP transfer client. Connects per operation to a node running
-/// [`serve_listener`]. The always-available backend before RDMA hardware: real
-/// bytes really cross a socket, measurable on any two machines / cloud VMs.
-#[derive(Clone, Debug, Default)]
-pub struct TcpTransfer;
-
-#[async_trait]
-impl Transfer for TcpTransfer {
-    fn name(&self) -> &str {
-        "tcp"
-    }
-
-    fn link_class(&self) -> LinkClass {
-        LinkClass::Tcp
-    }
-
-    async fn read(&self, remote: &NodeAddr, key: &KvBlockKey) -> Result<Bytes, TransferError> {
-        let mut sock = TcpStream::connect(remote).await?;
-        let key_bytes =
-            serde_json::to_vec(key).map_err(|e| TransferError::Protocol(e.to_string()))?;
-        sock.write_u8(OP_READ).await?;
-        sock.write_u32(key_bytes.len() as u32).await?;
-        sock.write_all(&key_bytes).await?;
-        sock.flush().await?;
-        match sock.read_u8().await? {
-            ST_OK => {
-                let len = sock.read_u64().await? as usize;
-                let mut buf = vec![0u8; len];
-                sock.read_exact(&mut buf).await?;
-                Ok(Bytes::from(buf))
-            }
-            ST_NOTFOUND => Err(TransferError::NotFound),
-            _ => Err(TransferError::Protocol("remote reported an error".into())),
-        }
-    }
-
-    async fn write(
-        &self,
-        remote: &NodeAddr,
-        key: &KvBlockKey,
-        data: Bytes,
-    ) -> Result<(), TransferError> {
-        let mut sock = TcpStream::connect(remote).await?;
-        let key_bytes =
-            serde_json::to_vec(key).map_err(|e| TransferError::Protocol(e.to_string()))?;
-        sock.write_u8(OP_WRITE).await?;
-        sock.write_u32(key_bytes.len() as u32).await?;
-        sock.write_all(&key_bytes).await?;
-        sock.write_u64(data.len() as u64).await?;
-        sock.write_all(&data).await?;
-        sock.flush().await?;
-        match sock.read_u8().await? {
-            ST_OK => Ok(()),
-            _ => Err(TransferError::Protocol("remote reported an error".into())),
-        }
-    }
-}
-
-/// Serves KV blocks to [`TcpTransfer`] clients. Anything that can produce / store
-/// block bytes (e.g. the store's local byte pool) plugs in here.
+/// Serves KV blocks to peers. Anything that can produce / store block bytes
+/// (e.g. a node's [`crate::LocalKvStore`] via [`crate::StoreBlockSource`]) plugs
+/// in here.
 pub trait BlockSource: Send + Sync + 'static {
     fn get(&self, key: &KvBlockKey) -> Option<Bytes>;
     fn put(&self, key: KvBlockKey, data: Bytes);
 }
 
-/// A simple in-memory [`BlockSource`] for tests and the local node.
+/// A simple in-memory [`BlockSource`] for tests.
 #[derive(Clone, Debug, Default)]
 pub struct MemBlockSource {
     inner: Arc<Mutex<HashMap<KvBlockKey, Bytes>>>,
@@ -280,8 +67,8 @@ impl BlockSource for MemBlockSource {
     }
 }
 
-/// Accept TCP transfer connections on an already-bound listener and serve blocks
-/// from `source`. Binding outside lets callers use port 0 and learn the address.
+/// Accept connections on an already-bound listener and serve blocks from
+/// `source`. Binding outside lets callers use port 0 and learn the address.
 pub async fn serve_listener<S: BlockSource>(
     listener: TcpListener,
     source: Arc<S>,
@@ -325,89 +112,4 @@ async fn handle_conn<S: BlockSource>(
     }
     sock.flush().await?;
     Ok(())
-}
-
-/// Reserved RDMA backend. The real implementation registers memory regions,
-/// posts RDMA READ/WRITE work requests via ibverbs, polls the completion queue,
-/// and (with GPUDirect) lands bytes straight in GPU HBM. Stubbed behind the
-/// `rdma` feature until a NIC is available — the trait above does not change.
-#[cfg(feature = "rdma")]
-#[derive(Clone, Debug, Default)]
-pub struct RdmaTransfer;
-
-#[cfg(feature = "rdma")]
-#[async_trait]
-impl Transfer for RdmaTransfer {
-    fn name(&self) -> &str {
-        "rdma"
-    }
-
-    fn link_class(&self) -> LinkClass {
-        LinkClass::RdmaRoce
-    }
-
-    async fn read(&self, _remote: &NodeAddr, _key: &KvBlockKey) -> Result<Bytes, TransferError> {
-        Err(TransferError::Unsupported(
-            "rdma backend not yet wired (needs an RDMA NIC + ibverbs)",
-        ))
-    }
-
-    async fn write(
-        &self,
-        _remote: &NodeAddr,
-        _key: &KvBlockKey,
-        _data: Bytes,
-    ) -> Result<(), TransferError> {
-        Err(TransferError::Unsupported(
-            "rdma backend not yet wired (needs an RDMA NIC + ibverbs)",
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key() -> KvBlockKey {
-        KvBlockKey::new("m", "t", "ten", "p", "blk", 0, 64)
-    }
-
-    #[tokio::test]
-    async fn local_transfer_roundtrips_real_bytes() {
-        let transfer = LocalTransfer::new();
-        let node = "node-1".to_string();
-        transfer
-            .write(&node, &key(), Bytes::from_static(b"kv-bytes"))
-            .await
-            .unwrap();
-        let got = transfer.read(&node, &key()).await.unwrap();
-        assert_eq!(&got[..], b"kv-bytes");
-        // A different node has nothing.
-        assert!(matches!(
-            transfer.read(&"node-2".to_string(), &key()).await,
-            Err(TransferError::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn tcp_transfer_roundtrips_over_a_socket() {
-        let source = Arc::new(MemBlockSource::new());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(serve_listener(listener, source.clone()));
-
-        let client = TcpTransfer;
-        client
-            .write(&addr, &key(), Bytes::from_static(b"hello-kv"))
-            .await
-            .unwrap();
-        let got = client.read(&addr, &key()).await.unwrap();
-        assert_eq!(&got[..], b"hello-kv");
-
-        let missing = KvBlockKey::new("m", "t", "ten", "p", "absent", 1, 64);
-        assert!(matches!(
-            client.read(&addr, &missing).await,
-            Err(TransferError::NotFound)
-        ));
-    }
 }

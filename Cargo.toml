@@ -48,6 +48,7 @@ futures-util = "0.3"
 reqwest = { workspace = true }
 quillcache-core = { version = "1.0.0-alpha.1", path = "crates/quillcache-core" }
 quillcache-store = { version = "1.0.0-alpha.1", path = "crates/quillcache-store" }
+quillcache-transfer-engine = { version = "1.0.0-alpha.1", path = "crates/quillcache-transfer-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
