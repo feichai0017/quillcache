@@ -120,7 +120,7 @@ how far each piece is integrated:
   `rdma` / `nvlink`): GPUDirect-RDMA / NVLink *zero-copy* needs a NIC / multi-GPU.
   Real interfaces, stubbed so the default build stays hardware-free.
 
-`cargo test` — 72 tests pass; `cargo fmt --check` and `cargo clippy` are clean. The
+`cargo test` — 73 tests pass; `cargo fmt --check` and `cargo clippy` are clean. The
 CUDA paths add 2 GPU tests (`#[ignore]`, L4-verified) and a `--features cuda`
 compile-check job in CI.
 

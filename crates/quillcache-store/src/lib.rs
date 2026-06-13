@@ -4,6 +4,11 @@
 //! - **`Client`** ([`DummyClient`] / [`RealClient`]) — the two-phase Put/Get API.
 //! - **`MasterService`** ([`MasterService`]) — object metadata, replica
 //!   allocation, the two-phase Put, lease-based eviction. No bytes flow through it.
+//!   - **HA** (Mooncake's high-availability mode): `snapshot` / `recover` (the
+//!     in-memory metadata snapshot, taken so a restarted or newly-elected master
+//!     rebuilds state), heartbeat-based segment health (failure detection), and
+//!     leader election (`master_election`, `--features etcd`) — multiple masters
+//!     coordinated through etcd, one leader serving, lease-backed failover.
 //! - **`BufferAllocator`** ([`OffsetBufferAllocator`]) + **`AllocationStrategy`**
 //!   ([`RandomAllocationStrategy`] / [`FreeRatioFirstAllocationStrategy`]).
 //! - **`Replica`** ([`Replica`], [`ReplicaData`]) — `Memory` (a mounted segment's
