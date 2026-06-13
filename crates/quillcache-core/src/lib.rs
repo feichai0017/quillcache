@@ -20,6 +20,7 @@ use std::str::FromStr;
 pub mod bench;
 pub mod conductor;
 pub mod control;
+pub mod replication;
 pub mod router;
 
 // Optional residency-index backends (the ART-vs-LSM study) live here as

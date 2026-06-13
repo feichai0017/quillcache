@@ -1,3 +1,7 @@
+use crate::replication::{
+    plan_replications, HotnessTracker, PrefixResidency, ReplicationAction, ReplicationConfig,
+    WorkerLoad,
+};
 use crate::router::{
     plan_for_worker, GreedyStatePlaneRouter, RouteDecision, RouterError, RoutingPolicy,
 };
@@ -276,6 +280,9 @@ pub struct ControlPlane {
     /// violate its SLO by more than this many microseconds. `None` admits all
     /// (Mooncake's overload-oriented early rejection).
     max_slo_violation_us: Option<u64>,
+    /// Per-(identity, prefix) access counts, so [`Self::replication_plan`] can spot
+    /// hot prefixes worth replicating to spread a cache hotspot's load.
+    hotness: HotnessTracker,
 }
 
 impl ControlPlane {
@@ -316,6 +323,7 @@ impl ControlPlane {
             use_conductor: false,
             cost_model: CostModel::default(),
             max_slo_violation_us: None,
+            hotness: HotnessTracker::default(),
         }
     }
 
@@ -468,6 +476,8 @@ impl ControlPlane {
     }
 
     pub fn plan(&self, request: &RequestShape) -> Result<RequestPlan, ControlError> {
+        // Count this request's prefixes for hot-prefix replication scheduling.
+        self.hotness.record_request(request);
         // The router only ever inspects residency for *this request's* blocks
         // (local hit / transfer / recompute per block), so look those up
         // directly instead of dumping the whole index. O(request blocks) point
@@ -694,6 +704,52 @@ impl ControlPlane {
         self.residency.as_ref()
     }
 
+    /// Decide which hot prefixes to replicate to spread cache hotspots: live
+    /// access counts (the request path feeds the hotness tracker) crossed with
+    /// where each hot prefix is resident (HBM) and current worker load. The cost
+    /// router places one request at a time; this is the global balancing the
+    /// Mooncake Conductor adds. The byte copies are the Transfer Engine's to
+    /// execute. See [`crate::replication`].
+    pub fn replication_plan(&self, cfg: &ReplicationConfig) -> Vec<ReplicationAction> {
+        let workers: Vec<WorkerLoad> = self
+            .workers
+            .iter()
+            .map(|w| WorkerLoad {
+                id: w.id.clone(),
+                load: w.running_decodes + w.queued_prefill_tokens,
+            })
+            .collect();
+        let prefixes: Vec<PrefixResidency> = self
+            .hotness
+            .hot(cfg.hotness_threshold)
+            .into_iter()
+            .map(|(scope, prefix_hash, accesses)| {
+                let mut holders: Vec<String> = self
+                    .residency
+                    .prefix_scan(&scope, &prefix_hash)
+                    .into_iter()
+                    .filter(|r| matches!(r.tier, CacheTier::Hbm | CacheTier::RemoteHbm))
+                    .map(|r| r.worker_id)
+                    .collect();
+                holders.sort();
+                holders.dedup();
+                PrefixResidency {
+                    scope,
+                    prefix_hash,
+                    holders,
+                    accesses,
+                }
+            })
+            .collect();
+        plan_replications(&prefixes, &workers, cfg)
+    }
+
+    /// Decay the prefix hotness counts (call periodically) so replication tracks
+    /// recent load rather than all-time totals.
+    pub fn decay_hotness(&self) {
+        self.hotness.decay();
+    }
+
     /// Persist the residency index (checkpoint a persistent backend; no-op for
     /// in-memory). Call periodically and on shutdown so a persistent index
     /// survives a restart.
@@ -872,6 +928,63 @@ mod tests {
         assert_eq!(summary.stored_blocks, 1);
         assert_eq!(index.len(), 1);
         assert_eq!(index.snapshot()[0].worker_id, "vllm-a");
+    }
+
+    #[test]
+    fn replication_plan_spreads_a_hot_singly_held_prefix() {
+        let key = KvBlockKey {
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            prefix_hash: "hotpre".to_string(),
+            block_hash: "blk0".to_string(),
+            block_index: 0,
+            token_count: 16,
+        };
+        // The hot prefix is resident on vllm-a only.
+        let mut index = MemoryIndex::new();
+        index.put(CacheResidency::hbm("vllm-a".to_string(), key.clone(), 1024));
+        let control = ControlPlane::with_index(
+            vec![
+                engine(),
+                EngineEndpoint {
+                    id: "vllm-b".to_string(),
+                    base_url: "http://127.0.0.1:8002".to_string(),
+                    ..engine()
+                },
+            ],
+            Box::new(index),
+        );
+
+        // Drive enough requests for the prefix to count as hot (record runs first
+        // in plan(), so it counts even if routing returns an error).
+        let req = RequestShape {
+            id: "r".to_string(),
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            session_id: None,
+            blocks: vec![key.clone()],
+            estimated_decode_tokens: 8,
+            slo: crate::SloTarget::default(),
+        };
+        for _ in 0..10 {
+            let _ = control.plan(&req);
+        }
+
+        let actions = control.replication_plan(&ReplicationConfig::default());
+        assert_eq!(actions.len(), 1, "one copy to reach target_replicas=2");
+        assert_eq!(actions[0].prefix_hash, "hotpre");
+        assert_eq!(actions[0].from_worker, "vllm-a");
+        assert_eq!(actions[0].to_worker, "vllm-b");
+
+        // After decay (10 -> 5, still >= threshold 8? no), it's no longer hot.
+        control.decay_hotness();
+        assert!(control
+            .replication_plan(&ReplicationConfig::default())
+            .is_empty());
     }
 
     #[test]
