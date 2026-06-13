@@ -1,6 +1,7 @@
 mod cluster;
 mod gateway;
 mod store_master_http;
+mod transfer_node;
 
 use crate::gateway::run_from_config_path;
 use clap::{Parser, Subcommand};
@@ -64,6 +65,15 @@ enum Command {
         #[arg(long, default_value = "random")]
         strategy: String,
     },
+    /// Run a standalone Transfer Engine storage node serving one named RAM
+    /// segment over the (segment, offset) wire — where a store client / engine
+    /// connector reads & writes KV bytes (bridge/).
+    TransferNode {
+        #[arg(long, default_value = "127.0.0.1:8100")]
+        addr: String,
+        #[arg(long, default_value = "seg-0")]
+        segment: String,
+    },
 }
 
 #[tokio::main]
@@ -82,6 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
         Command::StoreMaster { addr, strategy } => {
             store_master_http::run_store_master(addr, strategy).await?
+        }
+        Command::TransferNode { addr, segment } => {
+            transfer_node::run_transfer_node(addr, segment).await?
         }
         Command::BenchIndex {
             backend,
