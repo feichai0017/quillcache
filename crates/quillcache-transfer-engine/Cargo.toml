@@ -14,12 +14,27 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt"] }
 etcd-client = { version = "0.14", optional = true }
+# Real CUDA device segment (GPU HBM registered as a transfer-engine segment).
+# cudarc with dynamic-loading compiles without CUDA present; pinned to the 13.0
+# bindings to match the GPU image. See the `cuda` feature below.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "dynamic-loading",
+    "cuda-13000",
+] }
 
 [features]
 # RDMA / GPU transport backends (ibverbs / GPUDirect-RDMA / NVLink). Reserved
 # seams — implemented as Unsupported stubs until the hardware is wired.
 rdma = []
 nvlink = []
+# Real CUDA device segment: register GPU HBM as a transfer-engine segment and
+# serve it over the same one-sided (offset, length) wire as the host segment,
+# staging through cudaMemcpy (H2D/D2H). This is Mooncake's device-segment
+# registration; GPUDirect-RDMA / NVLink (the `nvlink` feature) is the zero-copy
+# network form that removes the host hop (reserved — needs a NIC / multi-GPU).
+# cudarc dynamic-loading => compiles with no CUDA toolkit; runs on a GPU box.
+cuda = ["dep:cudarc"]
 # etcd-backed metadata (Mooncake's etcd:// MetadataStoragePlugin) — the production
 # distributed metadata path. Off by default; needs a running etcd cluster (like
 # `rdma` needs a NIC). Pulls etcd-client (gRPC over tonic).

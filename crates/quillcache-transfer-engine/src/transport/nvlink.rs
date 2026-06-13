@@ -2,10 +2,12 @@
 //! — the GPU-resident data path: NVLink for intra-node GPU↔GPU, GPUDirect-RDMA
 //! for HBM↔NIC zero-copy. **This is where "CUDA" lives in Mooncake's Transfer
 //! Engine** — moving KV bytes to / from / between GPU HBM without staging through
-//! host memory — not a separate quantize-on-offload tier. Reserved seam: needs an
-//! NVIDIA GPU (CUDA + NVLink / IBGDA), stubbed until hardware is wired; the real
-//! impl lands behind `--features nvlink` and nothing above the [`Transport`] trait
-//! changes.
+//! host memory — not a separate quantize-on-offload tier. The host-staged form of
+//! a GPU HBM segment is already **real** ([`crate::device_segment`],
+//! `--features cuda`, L4-verified): register HBM, serve it over the one-sided wire
+//! via `cudaMemcpy`. NVLink / GPUDirect is the *zero-copy* form that removes the
+//! host hop — a reserved seam (needs an NVIDIA GPU + NVLink / IBGDA) landing behind
+//! `--features nvlink`; nothing above the [`Transport`] trait changes.
 //!
 //! (`quillcache-cuda` is a *different* concern — the Dynamo-KVBM HBM tier with
 //! FP16→FP8 quantize-on-offload, an LMCache/KVBM-flavored idea Mooncake does not

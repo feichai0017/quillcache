@@ -324,7 +324,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -396,6 +396,15 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "cudarc"
+version = "0.19.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc"
+dependencies = [
+ "libloading 0.9.0",
+]
 
 [[package]]
 name = "dashmap"
@@ -983,6 +992,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "librocksdb-sys"
 version = "0.16.0+8.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,6 +1341,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quillcache-cuda"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "bytes",
+ "cudarc",
+ "quillcache-core",
+]
+
+[[package]]
 name = "quillcache-store"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -1341,6 +1369,7 @@ version = "1.0.0-alpha.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "cudarc",
  "etcd-client",
  "serde",
  "serde_json",

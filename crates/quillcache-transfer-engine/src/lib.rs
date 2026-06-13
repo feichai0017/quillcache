@@ -10,6 +10,8 @@
 //! | `Transport` + subclasses (`transport/*`) | [`transport::Transport`] + backends |
 //! | &nbsp;&nbsp;`TcpTransport` | [`transport::tcp::TcpTransport`] — **real** |
 //! | &nbsp;&nbsp;`RdmaTransport` (ibverbs) | [`transport::rdma::RdmaTransport`] — reserved |
+//! | &nbsp;&nbsp;`NvlinkTransport` / `transport/device` | [`transport::nvlink`] (zero-copy) — reserved |
+//! | GPU HBM segment (device `cudaMalloc` registration) | [`device_segment::DeviceSegment`] — **real** (`--features cuda`) |
 //! | `TransferMetadata` (`transfer_metadata.h`) | [`metadata`] (`SegmentDesc`, backend) |
 //! | `Topology` (`topology.h`) | [`topology::Topology`] |
 //!
@@ -25,6 +27,8 @@
 //! This is Phase 1 of the Mooncake-faithful restructure: the store
 //! (`quillcache-store`) is rebuilt on this engine in a later phase.
 
+#[cfg(feature = "cuda")]
+pub mod device_segment;
 pub mod engine;
 pub mod metadata;
 #[cfg(feature = "etcd")]
@@ -33,6 +37,8 @@ pub mod multi_transport;
 pub mod topology;
 pub mod transport;
 
+#[cfg(feature = "cuda")]
+pub use device_segment::{serve_device_segment, DeviceSegment};
 pub use engine::TransferEngine;
 pub use metadata::{BufferDesc, InMemoryMetadata, MetadataBackend, SegmentDesc};
 #[cfg(feature = "etcd")]

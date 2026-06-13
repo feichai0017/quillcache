@@ -85,3 +85,23 @@ jobs:
       # needs a running etcd, so CI does not run it).
       - name: clippy + compile-check
         run: cargo clippy -p quillcache-transfer-engine --features etcd --all-targets -- -D warnings
+
+  cuda:
+    name: cuda device tier (compile-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The real CUDA device tier uses cudarc with `dynamic-loading`, so it
+      # COMPILES with no CUDA toolkit or GPU (libcuda is dlopen'd at runtime).
+      # The GPU round-trip tests are #[ignore]: run them on a GPU box via
+      # deploy/modal_cuda_verify.py.
+      - name: clippy + compile-check (--features cuda)
+        run: cargo clippy -p quillcache-cuda --features cuda --all-targets -- -D warnings

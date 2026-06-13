@@ -9,8 +9,12 @@
 //! block's footprint. The real path is behind the `cuda` feature, built on a GPU
 //! box; a host-only stub keeps callers compiling without an NVIDIA GPU.
 //!
-//! Excluded from the workspace so the default build never resolves `cudarc`.
-//! Build standalone: `cargo build --features cuda` on a GPU box.
+//! A workspace member, but the real path is behind the `cuda` feature: cudarc
+//! 0.19 with `dynamic-loading` compiles with no CUDA present (the default build
+//! is a host-only stub, so CI needs no toolkit) and runs on a GPU box. Build it
+//! with `cargo build -p quillcache-cuda --features cuda`; the H2D/D2H + FP8
+//! quantize round-trips are verified on a Modal NVIDIA L4 via
+//! `deploy/modal_cuda_verify.py` (the GPU tests are `#[ignore]`).
 
 /// The FP16 → FP8 (E4M3) quantize-on-offload kernel source. Compiled with `nvcc`
 /// on a GPU box and loaded by the device tier; embedded here as the reference.

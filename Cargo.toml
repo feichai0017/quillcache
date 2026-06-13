@@ -4,17 +4,19 @@ members = [
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
+    "crates/quillcache-cuda",
 ]
 default-members = [
     ".",
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
+    "crates/quillcache-cuda",
 ]
-# The CUDA device tier is excluded so the default build never resolves/compiles
-# cudarc on a machine with no NVIDIA GPU. Build it standalone on a GPU box:
-#   cd crates/quillcache-cuda && cargo build --features cuda
-exclude = ["crates/quillcache-cuda"]
+# quillcache-cuda is a workspace member, but its DEFAULT build is a host-only stub
+# (no cudarc), so `cargo build`/`test`/CI never need a CUDA toolkit. The real GPU
+# tier compiles with `--features cuda` — cudarc's `dynamic-loading` builds even
+# without CUDA present (it dlopen's libcuda at runtime) and executes on a GPU box.
 resolver = "2"
 
 [workspace.dependencies]

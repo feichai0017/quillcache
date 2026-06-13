@@ -6,19 +6,29 @@ description = "CUDA device tier for QuillCache: GPU HBM <-> host KV block copies
 license = "MIT"
 repository = "https://github.com/feichai0017/quillcache"
 
-# NOTE: this crate is intentionally EXCLUDED from the workspace (see the root
-# Cargo.toml `exclude`) so the default build/test on a machine with no NVIDIA GPU
-# never resolves or compiles `cudarc`. Build it on a GPU box:
-#     cd crates/quillcache-cuda && cargo build --features cuda
+# This crate is a workspace member, but its DEFAULT build is a host-only stub with
+# no cudarc dependency, so `cargo build`/`test`/CI need no CUDA toolkit. The real
+# GPU tier is behind `--features cuda`: cudarc with `dynamic-loading` compiles even
+# without CUDA installed (it dlopen's libcuda at runtime), so it builds on any host
+# and executes on a GPU box:
+#     cargo build -p quillcache-cuda --features cuda
 
 [dependencies]
 quillcache-core = { version = "1.0.0-alpha.1", path = "../quillcache-core" }
 bytes = "1"
-cudarc = { version = "0.12", optional = true }
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    # Pin the CUDA API bindings to 13.0 (matches the Modal GPU image: cuda-toolkit
+    # 13.x). dynamic-loading still dlopen's libcuda at runtime; this only selects
+    # which pre-generated sys bindings compile. Bump to match a different target.
+    "cuda-13000",
+] }
 
 [features]
 default = []
-# Real CUDA device tier. Needs the CUDA toolkit + an NVIDIA GPU at build/run time.
+# Real CUDA device tier (alloc + H2D/D2H + FP8 quantize-on-offload). cudarc's
+# dynamic-loading means this still compiles with no CUDA present; it loads libcuda
+# at runtime, so the real path only executes on an NVIDIA GPU box.
 cuda = ["dep:cudarc"]
-
-[workspace]
