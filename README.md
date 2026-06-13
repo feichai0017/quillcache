@@ -55,13 +55,14 @@ differentiation on top:
 
 | Mooncake / Dynamo | QuillCache | Status |
 | --- | --- | --- |
-| Transfer Engine (`TransferEngine` + `Transport`) | `quillcache-transfer-engine` (`engine` + `transport::{tcp,rdma}`) | ✅ TCP / ⊙ RDMA reserved |
+| Transfer Engine (`TransferEngine` + `Transport`) | `quillcache-transfer-engine` (`engine` + `transport::{tcp,rdma,nvlink}`) | ✅ TCP / ⊙ RDMA · NVLink reserved |
 | Store `Client` (`PutStart`/`PutEnd`/`Get`) | `DummyClient` / `RealClient` | ✅ end-to-end over the transfer engine |
 | Store `MasterService` (two-phase Put, eviction) | `MasterService` | ✅ replica alloc · lease eviction |
 | `BufferAllocator` + `AllocationStrategy` | `OffsetBufferAllocator` + `Random`/`FreeRatioFirst` | ✅ |
-| `TransferMetadata` (etcd/redis/http/p2p) | `MetadataBackend` (`InMemoryMetadata`) | ✅ / ⊙ etcd pluggable |
+| `TransferMetadata` (etcd/redis/http/p2p) | `MetadataBackend`: `InMemoryMetadata` / `EtcdMetadata` (feature `etcd`) | ✅ in-memory / ⊙ etcd (real, needs a server) |
 | Dynamo KV-router cost function | `DynamoCostRouter` | ✅ reproduces the worked example |
-| Dynamo KVBM tiers (G1/G2/G3) | `StoreDataPlane` (HBM/DRAM/SSD) | ✅ moves real bytes |
+| Dynamo KVBM tiers (G1 HBM / G2 host / G3 disk) | `StoreDataPlane` (DRAM/SSD) + `quillcache-cuda` (HBM G1 + FP8 quantize) | ✅ DRAM/SSD · ⊙ HBM (GPU box) |
+| Mooncake GPU data path (GPUDirect-RDMA · NVLink · GDS) | `rdma` / `nvlink` reserved transports | ⊙ needs a GPU / NIC |
 | Dynamo KV-Cache Indexer | residency index (Holt ART) | ✅ persistent |
 | — *(neither does this)* | **identity guard + crash-consistent `DiskTier`** | 🎯 differentiation |
 
@@ -92,10 +93,11 @@ how far each piece is integrated:
   two-phase Put + lease eviction, the identity guard, and `DiskTier` crash
   recovery. All covered by tests (and the `cluster` demo); wiring them into the
   live gateway needs an engine KV-connector for the engine⟷store byte handoff.
-- **⊙ reserved / needs hardware** — `RdmaTransport` (behind the `rdma` feature), the
-  etcd metadata backend, and the CUDA device tier (`quillcache-cuda --features
-  cuda` on a GPU box). All real interfaces, stubbed so the default build is
-  hardware-free.
+- **⊙ reserved / needs infra** — `RdmaTransport` / `NvlinkTransport` (behind
+  `rdma` / `nvlink`), the `EtcdMetadata` backend (behind `etcd` — real etcd-client
+  code + a background-watch-synced cache, compile-checked in CI, needs a running
+  etcd to run), and the CUDA device tier (`quillcache-cuda --features cuda` on a
+  GPU box). All real interfaces; the default build is hardware-free.
 
 `cargo test` — 60 tests pass; `cargo fmt --check` and `cargo clippy` are clean.
 
