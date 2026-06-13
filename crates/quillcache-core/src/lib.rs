@@ -30,7 +30,7 @@ pub mod index_holt;
 #[cfg(feature = "rocksdb")]
 pub mod index_rocksdb;
 
-pub use conductor::{KVEventHandler, KvCacheEvent, ModelContext, PrefixCacheTable};
+pub use conductor::{Conductor, KVEventHandler, KvCacheEvent, ModelContext, PrefixCacheTable};
 pub use control::*;
 pub use router::*;
 

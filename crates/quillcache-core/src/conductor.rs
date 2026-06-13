@@ -20,7 +20,8 @@
 //! guard holds at the routing layer too: a request never gets prefix credit for a
 //! different tenant / model / adapter's cache.
 
-use crate::IdentityScope;
+use crate::router::DynamoCostRouter;
+use crate::{IdentityScope, WorkerState};
 use std::collections::{HashMap, HashSet};
 
 /// A serving instance (engine / worker) id.
@@ -192,6 +193,59 @@ impl KVEventHandler {
     }
 }
 
+/// The cache-aware routing **Conductor**: a [`PrefixCacheTable`] (fed by KV events
+/// via the [`KVEventHandler`]) queried by the Dynamo cost function to pick the
+/// instance with the best KV-cache locality, traded off against load. This is
+/// Mooncake's `Conductor` job — "route this request where its prefix is already
+/// cached, unless that instance is too busy".
+#[derive(Debug, Default)]
+pub struct Conductor {
+    events: KVEventHandler,
+    router: DynamoCostRouter,
+}
+
+impl Conductor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply an engine's KV-cache event to the prefix table.
+    pub fn observe(&mut self, event: KvCacheEvent) {
+        self.events.handle(event);
+    }
+
+    pub fn table(&self) -> &PrefixCacheTable {
+        &self.events.table
+    }
+
+    /// Pick the lowest-cost instance for a request: the Dynamo cost over each
+    /// instance's contiguous prefix overlap (from the table) plus its load.
+    pub fn route(
+        &self,
+        ctx: &ModelContext,
+        prefix_hashes: &[PrefixHash],
+        workers: &[WorkerState],
+    ) -> Option<InstanceId> {
+        if workers.is_empty() {
+            return None;
+        }
+        let overlap = self.events.table.query_overlap(ctx, prefix_hashes);
+        let prompt_blocks = prefix_hashes.len();
+        let cost = |w: &WorkerState| {
+            self.router.cost_with_overlap(
+                prompt_blocks,
+                w.queued_prefill_tokens,
+                w.running_decodes,
+                overlap.get(&w.id).copied().unwrap_or(0),
+            )
+        };
+        workers
+            .iter()
+            .min_by(|a, b| cost(a).total_cmp(&cost(b)))
+            .map(|w| w.id.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +319,48 @@ mod tests {
             .table
             .query_overlap(&c, &[ph("p0"), ph("p1")])
             .is_empty());
+    }
+
+    #[test]
+    fn conductor_routes_to_the_instance_with_the_best_cached_prefix() {
+        let mut conductor = Conductor::new();
+        let c = ctx("ten-a");
+        conductor.observe(KvCacheEvent::BlockStored {
+            ctx: c.clone(),
+            prefix_hashes: vec![ph("p0"), ph("p1"), ph("p2")],
+            instance: "gpu-0".into(),
+        });
+        let workers = vec![
+            WorkerState::new("gpu-0", "dc"),
+            WorkerState::new("gpu-1", "dc"),
+        ];
+        let prefix = vec![ph("p0"), ph("p1"), ph("p2")];
+        // gpu-0 has the whole prefix cached → it wins on locality.
+        assert_eq!(
+            conductor.route(&c, &prefix, &workers).as_deref(),
+            Some("gpu-0")
+        );
+    }
+
+    #[test]
+    fn heavy_decode_load_spills_off_the_cache_hot_instance() {
+        let mut conductor = Conductor::new();
+        let c = ctx("ten-a");
+        conductor.observe(KvCacheEvent::BlockStored {
+            ctx: c.clone(),
+            prefix_hashes: vec![ph("p0"), ph("p1")],
+            instance: "gpu-0".into(),
+        });
+        let prefix = vec![ph("p0"), ph("p1")];
+        // gpu-0 has the cache but is swamped (100 running decodes); gpu-1 is idle.
+        // cost(gpu-0) = max(0, 2−2) + 100 = 100; cost(gpu-1) = max(0, 2−0) + 0 = 2.
+        let workers = vec![
+            WorkerState::new("gpu-0", "dc").with_load(0, 100),
+            WorkerState::new("gpu-1", "dc"),
+        ];
+        assert_eq!(
+            conductor.route(&c, &prefix, &workers).as_deref(),
+            Some("gpu-1")
+        );
     }
 }

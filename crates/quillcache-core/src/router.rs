@@ -631,6 +631,25 @@ impl DynamoCostRouter {
         self.config.prefill_load_scale * adjusted_prefill + decode_blocks
     }
 
+    /// Dynamo's per-worker cost from a precomputed **contiguous prefix-overlap**
+    /// block count (the Conductor's [`crate::PrefixCacheTable`] result) instead of
+    /// walking the residency snapshot. The overlap is credited at the device (HBM)
+    /// rate — an engine's prefix cache lives in GPU memory. Lower is better.
+    pub fn cost_with_overlap(
+        &self,
+        prompt_blocks: usize,
+        queued_prefill_tokens: u32,
+        running_decodes: u32,
+        overlap_blocks: usize,
+    ) -> f64 {
+        let block_tokens = self.config.block_tokens.max(1);
+        let queued_blocks = f64::from(queued_prefill_tokens) / f64::from(block_tokens);
+        let raw_prefill_blocks = prompt_blocks as f64 + queued_blocks;
+        let overlap_credit = self.config.overlap_score_credit * overlap_blocks as f64;
+        let adjusted_prefill = (raw_prefill_blocks - overlap_credit).max(0.0);
+        self.config.prefill_load_scale * adjusted_prefill + f64::from(running_decodes)
+    }
+
     pub fn route(
         &self,
         request: &RequestShape,
