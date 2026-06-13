@@ -13,11 +13,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+etcd-client = { version = "0.14", optional = true }
 
 [features]
-# RDMA transport backend (ibverbs / GPUDirect-RDMA). Reserved seam — the trait
-# is implemented as an Unsupported stub until an RDMA NIC is wired.
+# RDMA / GPU transport backends (ibverbs / GPUDirect-RDMA / NVLink). Reserved
+# seams — implemented as Unsupported stubs until the hardware is wired.
 rdma = []
+nvlink = []
+# etcd-backed metadata (Mooncake's etcd:// MetadataStoragePlugin) — the production
+# distributed metadata path. Off by default; needs a running etcd cluster (like
+# `rdma` needs a NIC). Pulls etcd-client (gRPC over tonic).
+etcd = ["dep:etcd-client"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

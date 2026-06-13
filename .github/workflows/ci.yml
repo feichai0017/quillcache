@@ -40,6 +40,9 @@ jobs:
           cargo test -p quillcache-core --features holt
           cargo build -p quillcache --features holt
 
+      - name: etcd metadata backend — compile-check (no etcd server needed)
+        run: cargo check -p quillcache-transfer-engine --features etcd
+
   rocksdb:
     name: rocksdb backend (LSM)
     runs-on: ubuntu-latest
