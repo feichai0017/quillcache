@@ -1,5 +1,6 @@
 mod cluster;
 mod gateway;
+mod store_master_http;
 
 use crate::gateway::run_from_config_path;
 use clap::{Parser, Subcommand};
@@ -54,6 +55,15 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         requests: usize,
     },
+    /// Run the store's MasterService over HTTP (Mooncake's master service): the
+    /// two-phase Put, identity-guarded Get, Mount, Remove, for out-of-process
+    /// engine KV connectors. Object bytes still move via the transfer engine.
+    StoreMaster {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        addr: String,
+        #[arg(long, default_value = "random")]
+        strategy: String,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Gateway { config } => run_from_config_path(config).await?,
         Command::Plan => print_plan(),
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
+        Command::StoreMaster { addr, strategy } => {
+            store_master_http::run_store_master(addr, strategy).await?
+        }
         Command::BenchIndex {
             backend,
             requests,
