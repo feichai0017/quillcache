@@ -22,11 +22,18 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "dynamic-loading",
     "cuda-13000",
 ] }
+# Real ibverbs RDMA transport (one-sided RDMA READ/WRITE). Raw libibverbs
+# bindings; needs libibverbs at build (and a real RDMA NIC or SoftRoCE/rxe to
+# run). Off by default — see the `rdma` feature.
+ibverbs-sys = { version = "0.3", optional = true }
 
 [features]
-# RDMA / GPU transport backends (ibverbs / GPUDirect-RDMA / NVLink). Reserved
-# seams — implemented as Unsupported stubs until the hardware is wired.
-rdma = []
+# Real ibverbs RDMA: one-sided RDMA READ/WRITE between registered memory by
+# (remote_addr, rkey) — Mooncake's primary data path. Needs libibverbs at build;
+# runs on a real RDMA NIC or SoftRoCE (rxe). Verified over SoftRoCE.
+rdma = ["dep:ibverbs-sys"]
+# NVLink GPU transport (GPUDirect). Reserved seam (the intra-node zero-copy peer
+# path lives in the `cuda` device segment); needs multi-GPU NVLink hardware.
 nvlink = []
 # Real CUDA device segment: register GPU HBM as a transfer-engine segment and
 # serve it over the same one-sided (offset, length) wire as the host segment,
