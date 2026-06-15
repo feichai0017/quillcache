@@ -35,6 +35,7 @@ pub mod metadata;
 #[cfg(feature = "etcd")]
 pub mod metadata_etcd;
 pub mod multi_transport;
+pub mod slice_pool;
 pub mod topology;
 pub mod transport;
 
@@ -46,6 +47,7 @@ pub use metadata::{BufferDesc, InMemoryMetadata, MetadataBackend, SegmentDesc};
 #[cfg(feature = "etcd")]
 pub use metadata_etcd::EtcdMetadata;
 pub use multi_transport::MultiTransport;
+pub use slice_pool::{run_slices, slices};
 pub use topology::Topology;
 pub use transport::{
     BatchId, LinkClass, OpCode, SegmentId, TransferError, TransferRequest, TransferStatus,

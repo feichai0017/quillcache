@@ -29,7 +29,29 @@ impl Topology {
             .map(|s| s.as_str())
     }
 
+    /// All preferred devices for a location, best first — for striping a transfer
+    /// across multiple NICs near the buffer (Mooncake's multi-NIC striping).
+    pub fn select_devices(&self, location: &str) -> &[String] {
+        self.matrix.get(location).map_or(&[], |v| v.as_slice())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.matrix.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_preferred_nics_by_location() {
+        let mut t = Topology::new();
+        t.set_preference("cuda:0", vec!["mlx5_0".into(), "mlx5_1".into()]);
+        assert_eq!(t.select_device("cuda:0"), Some("mlx5_0"));
+        assert_eq!(t.select_devices("cuda:0"), ["mlx5_0", "mlx5_1"]);
+        // Unknown location → no device (caller falls back to default routing).
+        assert_eq!(t.select_device("cpu:9"), None);
+        assert!(t.select_devices("cpu:9").is_empty());
     }
 }
