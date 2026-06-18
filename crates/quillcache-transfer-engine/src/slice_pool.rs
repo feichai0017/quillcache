@@ -8,7 +8,9 @@
 //! per slice (the byte movement, which is what only Linux CI can exercise).
 
 use crate::transport::TransferError;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 /// The `(offset, len)` slices covering `[0, total_len)` at `slice_size`
 /// granularity (the last slice carries the remainder).
@@ -83,6 +85,35 @@ pub fn layer_slices(layer_sizes: &[u64]) -> Vec<(usize, u64, u64)> {
         off += len;
     }
     out
+}
+
+/// Runtime measurements from a layer-wise KV transfer pass.
+///
+/// `time_to_first_layer_us` is when layer 0 becomes consumable, after the
+/// reorder gate. A later layer completing first does not count: decode cannot
+/// consume layer 1 before layer 0. `overlap_window_us` is the transfer time after
+/// layer 0 became available — the window the consumer can hide under compute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerTransferTelemetry {
+    pub layers: usize,
+    pub bytes: u64,
+    pub max_inflight: usize,
+    pub time_to_first_layer_us: Option<u64>,
+    pub full_transfer_us: u64,
+    pub overlap_window_us: u64,
+}
+
+impl LayerTransferTelemetry {
+    fn empty(max_inflight: usize) -> Self {
+        Self {
+            layers: 0,
+            bytes: 0,
+            max_inflight: max_inflight.max(1),
+            time_to_first_layer_us: None,
+            full_transfer_us: 0,
+            overlap_window_us: 0,
+        }
+    }
 }
 
 /// Transfer every layer of a KV blob with at most `max_inflight` layers in flight,
@@ -163,6 +194,57 @@ where
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// [`run_layers_with_notify`] plus wall-clock telemetry for the co-scheduler.
+///
+/// The measurement is backend-agnostic: `op` can be TCP today, ibverbs RDMA
+/// later, or GPUDirect/NVLink once available. The reported first-layer time is
+/// the consumer-visible latency after in-order gating, and the full-transfer time
+/// is the end of the transfer pass after all in-flight work drains.
+pub async fn run_layers_with_telemetry<F, Fut, N>(
+    layer_sizes: &[u64],
+    max_inflight: usize,
+    op: F,
+    mut on_layer_ready: N,
+) -> Result<LayerTransferTelemetry, TransferError>
+where
+    F: Fn(usize, u64, u64) -> Fut,
+    Fut: Future<Output = Result<(), TransferError>> + Send + 'static,
+    N: FnMut(usize),
+{
+    if layer_sizes.is_empty() {
+        return Ok(LayerTransferTelemetry::empty(max_inflight));
+    }
+
+    let start = Instant::now();
+    let bytes = layer_sizes.iter().sum();
+    let mut time_to_first_layer: Option<Duration> = None;
+    run_layers_with_notify(layer_sizes, max_inflight, op, |i| {
+        if i == 0 && time_to_first_layer.is_none() {
+            time_to_first_layer = Some(start.elapsed());
+        }
+        on_layer_ready(i);
+    })
+    .await?;
+    let full_transfer = start.elapsed();
+    let time_to_first_layer_us = time_to_first_layer.map(duration_us);
+    let overlap_window_us = time_to_first_layer_us
+        .map(|first| duration_us(full_transfer).saturating_sub(first))
+        .unwrap_or(0);
+
+    Ok(LayerTransferTelemetry {
+        layers: layer_sizes.len(),
+        bytes,
+        max_inflight: max_inflight.max(1),
+        time_to_first_layer_us,
+        full_transfer_us: duration_us(full_transfer),
+        overlap_window_us,
+    })
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -289,6 +371,59 @@ mod tests {
         assert!(
             !got.contains(&2) && !got.contains(&3),
             "no notify past the error gap (got {got:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn layer_telemetry_empty_transfer_is_zero() {
+        let telemetry =
+            run_layers_with_telemetry(&[], 0, |_i, _off, _len| async { Ok(()) }, |_| {})
+                .await
+                .unwrap();
+
+        assert_eq!(telemetry.layers, 0);
+        assert_eq!(telemetry.bytes, 0);
+        assert_eq!(telemetry.max_inflight, 1);
+        assert_eq!(telemetry.time_to_first_layer_us, None);
+        assert_eq!(telemetry.full_transfer_us, 0);
+        assert_eq!(telemetry.overlap_window_us, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn layer_telemetry_records_consumer_visible_first_layer() {
+        let notified = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let nf = notified.clone();
+        let telemetry = run_layers_with_telemetry(
+            &[10, 20, 30],
+            2,
+            move |i, _off, _len| async move {
+                let ms = if i == 0 { 25 } else { 5 };
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(())
+            },
+            move |i| nf.lock().unwrap().push(i),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*notified.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(telemetry.layers, 3);
+        assert_eq!(telemetry.bytes, 60);
+        assert_eq!(telemetry.max_inflight, 2);
+        let first = telemetry
+            .time_to_first_layer_us
+            .expect("first layer should be measured");
+        assert!(
+            first >= 20_000,
+            "first-layer latency should reflect slow layer 0, got {first}us"
+        );
+        assert!(
+            telemetry.full_transfer_us >= first,
+            "full transfer should finish after first layer"
+        );
+        assert_eq!(
+            telemetry.overlap_window_us,
+            telemetry.full_transfer_us.saturating_sub(first)
         );
     }
 

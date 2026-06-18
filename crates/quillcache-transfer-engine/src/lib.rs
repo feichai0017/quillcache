@@ -47,7 +47,10 @@ pub use metadata::{BufferDesc, InMemoryMetadata, MetadataBackend, SegmentDesc};
 #[cfg(feature = "etcd")]
 pub use metadata_etcd::EtcdMetadata;
 pub use multi_transport::MultiTransport;
-pub use slice_pool::{layer_slices, run_layers_with_notify, run_slices, slices};
+pub use slice_pool::{
+    layer_slices, run_layers_with_notify, run_layers_with_telemetry, run_slices, slices,
+    LayerTransferTelemetry,
+};
 pub use topology::Topology;
 pub use transport::{
     BatchId, LinkClass, OpCode, SegmentId, TransferError, TransferRequest, TransferStatus,

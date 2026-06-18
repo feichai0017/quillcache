@@ -125,3 +125,12 @@ barrier in front of serving. The gap widens as the layer count grows or as compu
 dominates (the common case) — transfer is then **fully** hidden. Backend-agnostic:
 the same scheduler over RDMA/GPUDirect (P2) only changes the per-layer cost, not the
 overlap structure.
+
+`run_layers_with_telemetry` now records the transfer-side runtime signal the
+co-scheduler needs: consumer-visible `time_to_first_layer_us`,
+`full_transfer_us`, and the remaining `overlap_window_us` after layer 0 becomes
+ready. The first-layer timestamp is measured after the in-order reorder gate, so
+an out-of-order later layer cannot create a false early-start signal. Current
+gateway metrics still use planner estimates; the next wiring step is to feed
+this measured telemetry through store/gateway action events into
+`TransferObservation`.
