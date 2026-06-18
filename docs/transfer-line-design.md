@@ -131,6 +131,7 @@ co-scheduler needs: consumer-visible `time_to_first_layer_us`,
 `full_transfer_us`, and the remaining `overlap_window_us` after layer 0 becomes
 ready. The first-layer timestamp is measured after the in-order reorder gate, so
 an out-of-order later layer cannot create a false early-start signal. Current
-gateway metrics still use planner estimates; the next wiring step is to feed
-this measured telemetry through store/gateway action events into
-`TransferObservation`.
+gateway metrics accept these measurements through `/v1/transfer-telemetry` and
+prefer them over planner estimates in `TransferObservation`; the next wiring step
+is to make the store/transfer adapter post the events automatically during real
+KV movement.

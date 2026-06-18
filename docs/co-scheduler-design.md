@@ -182,8 +182,12 @@ The initial policy should be deliberately simple and measurable.
   reports measured per-transfer completion times.
 - Add `run_layers_with_telemetry` in the Transfer Engine to measure
   consumer-visible first-layer latency, full-transfer latency, and overlap
-  window. Remaining wiring: feed these measured values into gateway/co-scheduler
-  telemetry and compare predicted-vs-actual TTFT.
+  window.
+- Add `/v1/transfer-telemetry` in the gateway so transfer adapters can report
+  measured telemetry. `TransferObservation` prefers measured values and falls
+  back to planner estimates when no measurement has arrived.
+- Remaining wiring: have the store/transfer adapter post these events
+  automatically and compare predicted-vs-actual TTFT.
 - Add a dry-run controller that logs actions without applying them.
 
 Acceptance: static serving behavior is unchanged; `/v1/state` exposes the

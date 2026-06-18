@@ -18,6 +18,7 @@ use quillcache_core::{
     RoundRobinRouter, RoutingPolicy, SessionAffinityRouter, SloAwareRouter,
 };
 use quillcache_store::{StoreDataPlane, StoreTierConfig};
+use quillcache_transfer_engine::LayerTransferTelemetry;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -225,6 +226,14 @@ struct GatewayMetrics {
     transfer_requests_total: AtomicU64,
     transfer_estimated_us_sum: AtomicU64,
     transfer_first_estimated_us_sum: AtomicU64,
+    transfer_measured_events_total: AtomicU64,
+    transfer_measured_first_layer_events_total: AtomicU64,
+    transfer_measured_bytes_total: AtomicU64,
+    transfer_measured_layers_total: AtomicU64,
+    transfer_measured_first_layer_us_sum: AtomicU64,
+    transfer_measured_full_us_sum: AtomicU64,
+    transfer_measured_overlap_us_sum: AtomicU64,
+    transfer_measured_queue_depth: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -269,7 +278,52 @@ impl GatewayMetrics {
         }
     }
 
+    fn record_transfer_telemetry(&self, event: &TransferTelemetryEvent) {
+        self.transfer_measured_events_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.transfer_measured_bytes_total
+            .fetch_add(event.telemetry.bytes, Ordering::Relaxed);
+        self.transfer_measured_layers_total
+            .fetch_add(event.telemetry.layers as u64, Ordering::Relaxed);
+        if let Some(first_us) = event.telemetry.time_to_first_layer_us {
+            self.transfer_measured_first_layer_events_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.transfer_measured_first_layer_us_sum
+                .fetch_add(first_us, Ordering::Relaxed);
+        }
+        self.transfer_measured_full_us_sum
+            .fetch_add(event.telemetry.full_transfer_us, Ordering::Relaxed);
+        self.transfer_measured_overlap_us_sum
+            .fetch_add(event.telemetry.overlap_window_us, Ordering::Relaxed);
+        if let Some(queue_depth) = event.queue_depth {
+            self.transfer_measured_queue_depth
+                .store(queue_depth, Ordering::Relaxed);
+        }
+    }
+
     fn transfer_observation(&self) -> TransferObservation {
+        let measured_events = self.transfer_measured_events_total.load(Ordering::Relaxed);
+        if measured_events > 0 {
+            let first_events = self
+                .transfer_measured_first_layer_events_total
+                .load(Ordering::Relaxed);
+            let first_us = self
+                .transfer_measured_first_layer_us_sum
+                .load(Ordering::Relaxed);
+            let full_us = self.transfer_measured_full_us_sum.load(Ordering::Relaxed);
+            let overlap_us = self
+                .transfer_measured_overlap_us_sum
+                .load(Ordering::Relaxed);
+            let bytes = self.transfer_measured_bytes_total.load(Ordering::Relaxed);
+            return TransferObservation {
+                time_to_first_layer_ms: avg_us_to_ms(first_us, first_events),
+                full_transfer_ms: avg_us_to_ms(full_us, measured_events),
+                overlap_saved_ms: avg_us_to_ms(overlap_us, measured_events),
+                queue_depth: self.transfer_measured_queue_depth.load(Ordering::Relaxed),
+                bandwidth_mbps: bandwidth_mbps(bytes, full_us),
+            };
+        }
+
         let transfer_requests = self.transfer_requests_total.load(Ordering::Relaxed);
         if transfer_requests == 0 {
             return TransferObservation::default();
@@ -284,6 +338,33 @@ impl GatewayMetrics {
             bandwidth_mbps: None,
         }
     }
+
+    fn transfer_summary(&self) -> TransferTelemetrySummary {
+        let measured_events = self.transfer_measured_events_total.load(Ordering::Relaxed);
+        let first_events = self
+            .transfer_measured_first_layer_events_total
+            .load(Ordering::Relaxed);
+        let bytes = self.transfer_measured_bytes_total.load(Ordering::Relaxed);
+        let layers = self.transfer_measured_layers_total.load(Ordering::Relaxed);
+        let first_us = self
+            .transfer_measured_first_layer_us_sum
+            .load(Ordering::Relaxed);
+        let full_us = self.transfer_measured_full_us_sum.load(Ordering::Relaxed);
+        let overlap_us = self
+            .transfer_measured_overlap_us_sum
+            .load(Ordering::Relaxed);
+        TransferTelemetrySummary {
+            measured_events,
+            measured_first_layer_events: first_events,
+            measured_bytes: bytes,
+            measured_layers: layers,
+            avg_time_to_first_layer_ms: avg_us_to_ms(first_us, first_events),
+            avg_full_transfer_ms: avg_us_to_ms(full_us, measured_events),
+            avg_overlap_window_ms: avg_us_to_ms(overlap_us, measured_events),
+            latest_queue_depth: self.transfer_measured_queue_depth.load(Ordering::Relaxed),
+            bandwidth_mbps: bandwidth_mbps(bytes, full_us),
+        }
+    }
 }
 
 fn pct(numerator: u64, denominator: u64) -> Option<f64> {
@@ -292,6 +373,50 @@ fn pct(numerator: u64, denominator: u64) -> Option<f64> {
     } else {
         Some(100.0 * numerator as f64 / denominator as f64)
     }
+}
+
+fn avg_us_to_ms(total_us: u64, count: u64) -> Option<f64> {
+    if count == 0 {
+        None
+    } else {
+        Some(total_us as f64 / count as f64 / 1_000.0)
+    }
+}
+
+fn bandwidth_mbps(bytes: u64, total_us: u64) -> Option<f64> {
+    if total_us == 0 {
+        None
+    } else {
+        Some(bytes as f64 * 8.0 / total_us as f64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferTelemetryEvent {
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub source_engine_id: Option<String>,
+    #[serde(default)]
+    pub target_engine_id: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub queue_depth: Option<u64>,
+    pub telemetry: LayerTransferTelemetry,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TransferTelemetrySummary {
+    pub measured_events: u64,
+    pub measured_first_layer_events: u64,
+    pub measured_bytes: u64,
+    pub measured_layers: u64,
+    pub avg_time_to_first_layer_ms: Option<f64>,
+    pub avg_full_transfer_ms: Option<f64>,
+    pub avg_overlap_window_ms: Option<f64>,
+    pub latest_queue_depth: u64,
+    pub bandwidth_mbps: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +816,7 @@ fn router(state: GatewayState) -> Router {
         .route("/v1/state", get(state_snapshot))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/kv-events", post(ingest_kv_events))
+        .route("/v1/transfer-telemetry", post(ingest_transfer_telemetry))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/completions", post(proxy_completions))
         .with_state(state)
@@ -727,6 +853,30 @@ async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoRespons
             "# HELP quillcache_transfer_first_estimated_us_sum Sum of planner-estimated first KV fetch time.\n",
             "# TYPE quillcache_transfer_first_estimated_us_sum counter\n",
             "quillcache_transfer_first_estimated_us_sum {tfs}\n",
+            "# HELP quillcache_transfer_measured_events_total Layer-wise transfer telemetry events reported by the transfer engine.\n",
+            "# TYPE quillcache_transfer_measured_events_total counter\n",
+            "quillcache_transfer_measured_events_total {tme}\n",
+            "# HELP quillcache_transfer_measured_first_layer_events_total Measured transfer events that made layer 0 consumable.\n",
+            "# TYPE quillcache_transfer_measured_first_layer_events_total counter\n",
+            "quillcache_transfer_measured_first_layer_events_total {tmfe}\n",
+            "# HELP quillcache_transfer_measured_bytes_total Bytes covered by measured transfer telemetry.\n",
+            "# TYPE quillcache_transfer_measured_bytes_total counter\n",
+            "quillcache_transfer_measured_bytes_total {tmb}\n",
+            "# HELP quillcache_transfer_measured_layers_total Layers covered by measured transfer telemetry.\n",
+            "# TYPE quillcache_transfer_measured_layers_total counter\n",
+            "quillcache_transfer_measured_layers_total {tml}\n",
+            "# HELP quillcache_transfer_measured_first_layer_us_sum Sum of measured consumer-visible first-layer latency.\n",
+            "# TYPE quillcache_transfer_measured_first_layer_us_sum counter\n",
+            "quillcache_transfer_measured_first_layer_us_sum {tmf}\n",
+            "# HELP quillcache_transfer_measured_full_us_sum Sum of measured full-transfer latency.\n",
+            "# TYPE quillcache_transfer_measured_full_us_sum counter\n",
+            "quillcache_transfer_measured_full_us_sum {tmfull}\n",
+            "# HELP quillcache_transfer_measured_overlap_us_sum Sum of measured transfer overlap windows.\n",
+            "# TYPE quillcache_transfer_measured_overlap_us_sum counter\n",
+            "quillcache_transfer_measured_overlap_us_sum {tmo}\n",
+            "# HELP quillcache_transfer_measured_queue_depth Latest reported transfer queue depth.\n",
+            "# TYPE quillcache_transfer_measured_queue_depth gauge\n",
+            "quillcache_transfer_measured_queue_depth {tmq}\n",
             "# HELP quillcache_recompute_blocks_total KV blocks recomputed on a cache miss.\n",
             "# TYPE quillcache_recompute_blocks_total counter\n",
             "quillcache_recompute_blocks_total {rb}\n",
@@ -755,6 +905,14 @@ async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoRespons
         trq = g(&m.transfer_requests_total),
         tes = g(&m.transfer_estimated_us_sum),
         tfs = g(&m.transfer_first_estimated_us_sum),
+        tme = g(&m.transfer_measured_events_total),
+        tmfe = g(&m.transfer_measured_first_layer_events_total),
+        tmb = g(&m.transfer_measured_bytes_total),
+        tml = g(&m.transfer_measured_layers_total),
+        tmf = g(&m.transfer_measured_first_layer_us_sum),
+        tmfull = g(&m.transfer_measured_full_us_sum),
+        tmo = g(&m.transfer_measured_overlap_us_sum),
+        tmq = g(&m.transfer_measured_queue_depth),
         rb = g(&m.recompute_blocks_total),
         rub = g(&m.reusable_blocks_total),
         rr = g(&m.reuse_refused_total),
@@ -803,6 +961,7 @@ async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse 
         "data_plane_residency": control.data_plane().snapshot(),
         "action_sink": state.action_sink.as_ref().map(ActionSink::snapshot).unwrap_or_else(ActionSinkSnapshot::disabled),
         "slo_goodput": state.slo.snapshot(),
+        "transfer_telemetry": state.metrics.transfer_summary(),
         "co_scheduler": {
             "policy": state.co_scheduler.policy,
             "snapshot": co_scheduler_snapshot,
@@ -820,6 +979,14 @@ async fn ingest_kv_events(
     let mut control = state.control.write().await;
     let summary = control.ingest(batch)?;
     Ok(Json(summary))
+}
+
+async fn ingest_transfer_telemetry(
+    State(state): State<GatewayState>,
+    Json(event): Json<TransferTelemetryEvent>,
+) -> Json<TransferTelemetrySummary> {
+    state.metrics.record_transfer_telemetry(&event);
+    Json(state.metrics.transfer_summary())
 }
 
 async fn proxy_chat_completions(
@@ -1452,6 +1619,64 @@ mod tests {
         let transfer = m.transfer_observation();
         assert_eq!(transfer.full_transfer_ms, Some(1.2));
         assert_eq!(transfer.time_to_first_layer_ms, Some(0.4));
+    }
+
+    #[test]
+    fn measured_transfer_telemetry_overrides_planner_estimates() {
+        let trace = GatewayRouteTrace {
+            request_id: "r".to_string(),
+            mode: ServingMode::Aggregated,
+            engine_id: "e".to_string(),
+            prefill_engine_id: None,
+            decode_engine_id: "e".to_string(),
+            planner_actions: 0,
+            reusable_blocks: 1,
+            local_hits: 0,
+            transfer_blocks: 1,
+            recompute_blocks: 0,
+            reuse_refused: 0,
+            estimated_ttft_us: 0,
+            estimated_tpot_us: 0,
+            estimated_transfer_us: 99_000,
+            estimated_first_transfer_us: 88_000,
+        };
+        let event = TransferTelemetryEvent {
+            request_id: Some("r".to_string()),
+            source_engine_id: Some("src".to_string()),
+            target_engine_id: Some("e".to_string()),
+            backend: Some("tcp".to_string()),
+            queue_depth: Some(7),
+            telemetry: LayerTransferTelemetry {
+                layers: 2,
+                bytes: 1_000,
+                max_inflight: 2,
+                time_to_first_layer_us: Some(1_000),
+                full_transfer_us: 4_000,
+                overlap_window_us: 3_000,
+            },
+        };
+
+        let m = GatewayMetrics::default();
+        m.record(&trace);
+        m.record_transfer_telemetry(&event);
+
+        let observation = m.transfer_observation();
+        assert_eq!(observation.time_to_first_layer_ms, Some(1.0));
+        assert_eq!(observation.full_transfer_ms, Some(4.0));
+        assert_eq!(observation.overlap_saved_ms, Some(3.0));
+        assert_eq!(observation.queue_depth, 7);
+        assert_eq!(observation.bandwidth_mbps, Some(2.0));
+
+        let summary = m.transfer_summary();
+        assert_eq!(summary.measured_events, 1);
+        assert_eq!(summary.measured_first_layer_events, 1);
+        assert_eq!(summary.measured_bytes, 1_000);
+        assert_eq!(summary.measured_layers, 2);
+        assert_eq!(summary.avg_time_to_first_layer_ms, Some(1.0));
+        assert_eq!(summary.avg_full_transfer_ms, Some(4.0));
+        assert_eq!(summary.avg_overlap_window_ms, Some(3.0));
+        assert_eq!(summary.latest_queue_depth, 7);
+        assert_eq!(summary.bandwidth_mbps, Some(2.0));
     }
 
     #[test]
