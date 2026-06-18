@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use futures_util::StreamExt;
 use quillcache_core::{
     CacheObservation, CoScheduler, CoSchedulerTelemetry, ControlPlane, IngestSummary, PlanAction,
-    RequestPlan, ServingMode, SloObservation, TransferObservation,
+    PlanActionKind, RequestPlan, ServingMode, SloObservation, TransferObservation,
 };
 use quillcache_core::{
     DataPlane, DataPlaneAction, EngineEndpoint, ExternalKvBlockKey, IndexBackend, KvBlockKey,
@@ -222,6 +222,9 @@ struct GatewayMetrics {
     transfer_blocks_total: AtomicU64,
     recompute_blocks_total: AtomicU64,
     reuse_refused_total: AtomicU64,
+    transfer_requests_total: AtomicU64,
+    transfer_estimated_us_sum: AtomicU64,
+    transfer_first_estimated_us_sum: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -237,6 +240,13 @@ impl GatewayMetrics {
             .fetch_add(t.recompute_blocks as u64, Ordering::Relaxed);
         self.reuse_refused_total
             .fetch_add(t.reuse_refused as u64, Ordering::Relaxed);
+        if t.transfer_blocks > 0 {
+            self.transfer_requests_total.fetch_add(1, Ordering::Relaxed);
+            self.transfer_estimated_us_sum
+                .fetch_add(t.estimated_transfer_us, Ordering::Relaxed);
+            self.transfer_first_estimated_us_sum
+                .fetch_add(t.estimated_first_transfer_us, Ordering::Relaxed);
+        }
     }
 
     fn observation(&self) -> CacheObservation {
@@ -256,6 +266,22 @@ impl GatewayMetrics {
             reuse_refused,
             local_hit_rate_pct: pct(local_hits, routed_blocks),
             remote_hit_rate_pct: pct(remote_hits, routed_blocks),
+        }
+    }
+
+    fn transfer_observation(&self) -> TransferObservation {
+        let transfer_requests = self.transfer_requests_total.load(Ordering::Relaxed);
+        if transfer_requests == 0 {
+            return TransferObservation::default();
+        }
+        let full_us = self.transfer_estimated_us_sum.load(Ordering::Relaxed);
+        let first_us = self.transfer_first_estimated_us_sum.load(Ordering::Relaxed);
+        TransferObservation {
+            time_to_first_layer_ms: Some(first_us as f64 / transfer_requests as f64 / 1_000.0),
+            full_transfer_ms: Some(full_us as f64 / transfer_requests as f64 / 1_000.0),
+            overlap_saved_ms: None,
+            queue_depth: 0,
+            bandwidth_mbps: None,
         }
     }
 }
@@ -296,6 +322,32 @@ pub struct GatewayRouteTrace {
     pub reuse_refused: usize,
     pub estimated_ttft_us: u64,
     pub estimated_tpot_us: u64,
+    pub estimated_transfer_us: u64,
+    pub estimated_first_transfer_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TransferCostSummary {
+    estimated_transfer_us: u64,
+    estimated_first_transfer_us: u64,
+}
+
+fn transfer_cost_summary(plan: &RequestPlan) -> TransferCostSummary {
+    let mut summary = TransferCostSummary::default();
+    for action in &plan.actions {
+        if action.kind != PlanActionKind::Fetch {
+            continue;
+        }
+        summary.estimated_transfer_us = summary
+            .estimated_transfer_us
+            .saturating_add(action.estimated_us);
+        summary.estimated_first_transfer_us = if summary.estimated_first_transfer_us == 0 {
+            action.estimated_us
+        } else {
+            summary.estimated_first_transfer_us.min(action.estimated_us)
+        };
+    }
+    summary
 }
 
 #[derive(Debug, Clone)]
@@ -666,6 +718,15 @@ async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoRespons
             "# HELP quillcache_transfer_blocks_total KV blocks fetched from the store / another worker.\n",
             "# TYPE quillcache_transfer_blocks_total counter\n",
             "quillcache_transfer_blocks_total {tb}\n",
+            "# HELP quillcache_transfer_requests_total Requests whose plan includes remote KV fetches.\n",
+            "# TYPE quillcache_transfer_requests_total counter\n",
+            "quillcache_transfer_requests_total {trq}\n",
+            "# HELP quillcache_transfer_estimated_us_sum Sum of planner-estimated full KV fetch time.\n",
+            "# TYPE quillcache_transfer_estimated_us_sum counter\n",
+            "quillcache_transfer_estimated_us_sum {tes}\n",
+            "# HELP quillcache_transfer_first_estimated_us_sum Sum of planner-estimated first KV fetch time.\n",
+            "# TYPE quillcache_transfer_first_estimated_us_sum counter\n",
+            "quillcache_transfer_first_estimated_us_sum {tfs}\n",
             "# HELP quillcache_recompute_blocks_total KV blocks recomputed on a cache miss.\n",
             "# TYPE quillcache_recompute_blocks_total counter\n",
             "quillcache_recompute_blocks_total {rb}\n",
@@ -691,6 +752,9 @@ async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoRespons
         req = g(&m.requests_total),
         lh = g(&m.local_hits_total),
         tb = g(&m.transfer_blocks_total),
+        trq = g(&m.transfer_requests_total),
+        tes = g(&m.transfer_estimated_us_sum),
+        tfs = g(&m.transfer_first_estimated_us_sum),
         rb = g(&m.recompute_blocks_total),
         rub = g(&m.reusable_blocks_total),
         rr = g(&m.reuse_refused_total),
@@ -724,7 +788,7 @@ async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse 
         CoSchedulerTelemetry {
             slo: state.slo.observation(),
             cache: state.metrics.observation(),
-            transfer: TransferObservation::default(),
+            transfer: state.metrics.transfer_observation(),
         },
         hotness_threshold,
     );
@@ -791,6 +855,7 @@ async fn proxy_openai_path(
         let control = state.control.read().await;
         let plan = control.plan(&request_shape)?;
         let decision = &plan.route;
+        let transfer_costs = transfer_cost_summary(&plan);
         // Identity guard: how many content-matching blocks we refused to reuse
         // because they belong to another identity (the safety property, made
         // observable on the live path).
@@ -813,6 +878,8 @@ async fn proxy_openai_path(
             reuse_refused: audit.refused_unsafe,
             estimated_ttft_us: decision.estimated_ttft_us,
             estimated_tpot_us: decision.estimated_tpot_us,
+            estimated_transfer_us: transfer_costs.estimated_transfer_us,
+            estimated_first_transfer_us: transfer_costs.estimated_first_transfer_us,
         };
         let action_plan = ActionSinkPlan::from(&plan);
         (engine, trace, action_plan)
@@ -950,6 +1017,14 @@ async fn proxy_openai_path(
         .header(
             "x-quillcache-estimated-ttft-us",
             trace.estimated_ttft_us.to_string(),
+        )
+        .header(
+            "x-quillcache-estimated-transfer-us",
+            trace.estimated_transfer_us.to_string(),
+        )
+        .header(
+            "x-quillcache-estimated-first-transfer-us",
+            trace.estimated_first_transfer_us.to_string(),
         );
     // Stream the upstream body straight through (SSE chunks forwarded as they
     // arrive) instead of buffering it, so the client's time-to-first-token
@@ -1314,6 +1389,8 @@ mod tests {
             reuse_refused: 0,
             estimated_ttft_us: 10,
             estimated_tpot_us: 20,
+            estimated_transfer_us: 0,
+            estimated_first_transfer_us: 0,
         };
         let plan = ActionSinkPlan {
             mode: ServingMode::Aggregated,
@@ -1339,24 +1416,28 @@ mod tests {
 
     #[test]
     fn metrics_aggregate_route_traces_into_totals() {
-        let mk = |local, transfer, recompute, refused, reusable| GatewayRouteTrace {
-            request_id: "r".to_string(),
-            mode: ServingMode::Aggregated,
-            engine_id: "e".to_string(),
-            prefill_engine_id: None,
-            decode_engine_id: "e".to_string(),
-            planner_actions: 0,
-            reusable_blocks: reusable,
-            local_hits: local,
-            transfer_blocks: transfer,
-            recompute_blocks: recompute,
-            reuse_refused: refused,
-            estimated_ttft_us: 0,
-            estimated_tpot_us: 0,
+        let mk = |local, transfer, recompute, refused, reusable, transfer_us, first_us| {
+            GatewayRouteTrace {
+                request_id: "r".to_string(),
+                mode: ServingMode::Aggregated,
+                engine_id: "e".to_string(),
+                prefill_engine_id: None,
+                decode_engine_id: "e".to_string(),
+                planner_actions: 0,
+                reusable_blocks: reusable,
+                local_hits: local,
+                transfer_blocks: transfer,
+                recompute_blocks: recompute,
+                reuse_refused: refused,
+                estimated_ttft_us: 0,
+                estimated_tpot_us: 0,
+                estimated_transfer_us: transfer_us,
+                estimated_first_transfer_us: first_us,
+            }
         };
         let m = GatewayMetrics::default();
-        m.record(&mk(3, 1, 2, 1, 4));
-        m.record(&mk(2, 0, 1, 0, 2));
+        m.record(&mk(3, 1, 2, 1, 4, 1_200, 400));
+        m.record(&mk(2, 0, 1, 0, 2, 0, 0));
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         assert_eq!(g(&m.requests_total), 2);
         assert_eq!(g(&m.local_hits_total), 5);
@@ -1364,6 +1445,64 @@ mod tests {
         assert_eq!(g(&m.recompute_blocks_total), 3);
         assert_eq!(g(&m.reuse_refused_total), 1);
         assert_eq!(g(&m.reusable_blocks_total), 6);
+        assert_eq!(g(&m.transfer_requests_total), 1);
+        assert_eq!(g(&m.transfer_estimated_us_sum), 1_200);
+        assert_eq!(g(&m.transfer_first_estimated_us_sum), 400);
+
+        let transfer = m.transfer_observation();
+        assert_eq!(transfer.full_transfer_ms, Some(1.2));
+        assert_eq!(transfer.time_to_first_layer_ms, Some(0.4));
+    }
+
+    #[test]
+    fn transfer_cost_summary_reads_fetch_actions() {
+        let block = KvBlockKey::new("m", "t", "tenant", "root", "b", 0, 64);
+        let plan = RequestPlan {
+            mode: ServingMode::Aggregated,
+            execution_worker_id: "e".to_string(),
+            prefill_worker_id: None,
+            decode_worker_id: "e".to_string(),
+            route: quillcache_core::RouteDecision {
+                request_id: "r".to_string(),
+                worker_id: "e".to_string(),
+                local_hits: vec![],
+                transfers: vec![],
+                recomputes: vec![],
+                estimated_ttft_us: 0,
+                estimated_tpot_us: 0,
+                slo_violation_us: 0,
+            },
+            actions: vec![
+                PlanAction {
+                    kind: PlanActionKind::Fetch,
+                    worker_id: "e".to_string(),
+                    source_worker_id: Some("src-a".to_string()),
+                    key: Some(block.clone()),
+                    tier: None,
+                    estimated_us: 900,
+                },
+                PlanAction {
+                    kind: PlanActionKind::Fetch,
+                    worker_id: "e".to_string(),
+                    source_worker_id: Some("src-b".to_string()),
+                    key: Some(block),
+                    tier: None,
+                    estimated_us: 300,
+                },
+                PlanAction {
+                    kind: PlanActionKind::Decode,
+                    worker_id: "e".to_string(),
+                    source_worker_id: None,
+                    key: None,
+                    tier: None,
+                    estimated_us: 50,
+                },
+            ],
+        };
+
+        let summary = transfer_cost_summary(&plan);
+        assert_eq!(summary.estimated_transfer_us, 1_200);
+        assert_eq!(summary.estimated_first_transfer_us, 300);
     }
 
     #[test]

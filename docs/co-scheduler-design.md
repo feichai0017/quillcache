@@ -177,8 +177,12 @@ The initial policy should be deliberately simple and measurable.
   residency/data-plane metrics, and hot-prefix counters.
 - Expose a `/v1/state.co_scheduler` dry-run plan in the gateway. P0 emits
   suggestions only; it does not mutate routing, placement, or worker roles.
-- Export metrics for time-to-first-layer, full-transfer time, overlap saved ms,
-  HBM/DRAM/SSD pressure, and predicted-vs-actual TTFT.
+- Export gateway metrics for planner-estimated full KV fetch time and first
+  fetch time; feed those into `TransferObservation` until the Transfer Engine
+  reports measured per-transfer completion times.
+- Remaining telemetry: measured time-to-first-layer, full-transfer time,
+  overlap saved ms, and predicted-vs-actual TTFT once layer-aware transfer
+  execution is connected.
 - Add a dry-run controller that logs actions without applying them.
 
 Acceptance: static serving behavior is unchanged; `/v1/state` exposes the
