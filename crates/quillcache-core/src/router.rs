@@ -763,6 +763,68 @@ mod tests {
         }
     }
 
+    // Run with: cargo test -p quillcache-core demo_routing -- --nocapture
+    #[test]
+    fn demo_routing_cost_decisions() {
+        let cm = CostModel::default();
+        let mut req = request_with_shared_block(); // 1 block · 128 tokens · decode 32
+        let block = req.blocks[0].clone();
+        let workers = vec![
+            WorkerState::new("w0", "rack-a"),
+            WorkerState::new("w1", "rack-a"),
+        ];
+        let wb: std::collections::HashMap<&str, &WorkerState> =
+            workers.iter().map(|w| (w.id.as_str(), w)).collect();
+
+        println!("\n  constants: prefill 45µs/tok · HBM 5µs · remote-HBM 20µs/MB · SSD 280µs/MB · objstore 1800µs/MB · decode 80µs/tok");
+        println!(
+            "  block = 128 tokens, 4 MB  →  recompute(prefill) = 45×128 = {}µs\n",
+            cm.prefill_cost_us(128)
+        );
+
+        let cold = GreedyStatePlaneRouter::default()
+            .route(&req, &workers, &[])
+            .unwrap();
+        println!(
+            "  A) COLD (nobody cached)        → engine {:<3} local={} transfer={} recompute={}  ttft={}µs   [must prefill]",
+            cold.worker_id, cold.local_hits.len(), cold.transfers.len(), cold.recomputes.len(), cold.estimated_ttft_us
+        );
+
+        let warm = vec![CacheResidency::hbm("w1", block.clone(), 4 * 1024 * 1024)];
+        let w = GreedyStatePlaneRouter::default()
+            .route(&req, &workers, &warm)
+            .unwrap();
+        println!(
+            "  B) WARM (w1 has it in HBM)     → engine {:<3} local={} transfer={} recompute={}  ttft={}µs   [skip prefill → ~straight to decode]",
+            w.worker_id, w.local_hits.len(), w.transfers.len(), w.recomputes.len(), w.estimated_ttft_us
+        );
+
+        let t = plan_for_worker(&cm, &req, &workers[0], &wb, &warm);
+        println!(
+            "  C) TRANSFER (target w0, w1 has it) →        local={} transfer={} recompute={}  ttft={}µs   [fetch KV from peer, cheaper than prefill]",
+            t.local_hits.len(), t.transfers.len(), t.recomputes.len(), t.estimated_ttft_us
+        );
+
+        req.blocks[0].token_count = 1;
+        let far = vec![CacheResidency {
+            key: req.blocks[0].clone(),
+            worker_id: "store".into(),
+            tier: CacheTier::ObjectStore,
+            bytes: 64 * 1024 * 1024,
+            last_access_ms: 0,
+            ref_count: 0,
+            pinned: false,
+        }];
+        let d = GreedyStatePlaneRouter::default()
+            .route(&req, &workers, &far)
+            .unwrap();
+        println!(
+            "  D) FAR (1-tok block, only objstore 64MB) → local={} transfer={} recompute={}  [recompute 45µs < transfer {}µs → prefill wins]\n",
+            d.local_hits.len(), d.transfers.len(), d.recomputes.len(),
+            cm.transfer_cost_us(CacheTier::ObjectStore, 64 * 1024 * 1024, false, false)
+        );
+    }
+
     #[test]
     fn routes_to_worker_with_local_cache_hit() {
         let request = request_with_shared_block();

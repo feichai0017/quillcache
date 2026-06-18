@@ -52,6 +52,7 @@ Run it (see deploy/modal_vllm_connector.py for the full Modal recipe):
       }'
 """
 
+import concurrent.futures
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -217,6 +218,13 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
         self._disagg_load: dict[str, str] = {}
         # Worker-side: key-prefixes saved this step -> aligned token count (for manifest).
         self._saved_this_step: dict[str, int] = {}
+        # Worker-side layer-wise-overlap load state: per-layer in-flight prefetches,
+        # plus the forward context captured at start_load_kv and consumed per layer
+        # in wait_for_layer_load. The executor is created on the worker only.
+        self._pending_layer_loads: dict[str, list] = {}
+        self._load_forward_context: "ForwardContext | None" = None
+        self._load_attn_metadata: Any = None
+        self._load_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
 
         # The worker owns byte movement; it registers the storage segments on the
         # master so put_start can allocate on them. Idempotent-tolerant.
@@ -226,6 +234,15 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     self._master.mount(name, 1 << 30)
                 except Exception as e:  # already mounted, or master not up yet
                     logger.info("segment %s mount skipped: %s", name, e)
+            # A single background fetch thread prefetches each layer's KV while the
+            # forward pass computes the previous layer, so KV load hides behind
+            # compute instead of blocking it. One worker keeps the store clients
+            # single-threaded (no concurrent-access assumption); raise max_workers
+            # only if StoreMasterClient/TransferEngineClient are thread-safe (then
+            # layers also fetch in parallel for bandwidth).
+            self._load_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="qc-kv-load"
+            )
 
         logger.info(
             "QuillCacheV1Connector role=%s kv_role=%s(producer=%s consumer=%s) master=%s segments=%s identity=%s",
@@ -308,36 +325,45 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
     # Worker-side methods
     # ==============================
 
+    def _inject_kv_into_layer(
+        self,
+        dst_kv_cache_layer: torch.Tensor,
+        src_kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> None:
+        """Inject one layer's store-resident KV into vLLM's paged buffer. Verbatim
+        from vLLM's ExampleConnector — layout-correct per attention backend."""
+        dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
+        if isinstance(attn_metadata, MLACommonMetadata):
+            num_pages = dst_kv_cache_layer_shape[0]
+            page_size = dst_kv_cache_layer_shape[1]
+            dst_kv_cache_layer = dst_kv_cache_layer.reshape(num_pages * page_size, -1)
+            dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
+        elif isinstance(attn_metadata, TritonAttentionMetadata):
+            block_idxs = slot_mapping // self._block_size
+            offsets = slot_mapping % self._block_size
+            dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
+        else:
+            num_pages = dst_kv_cache_layer_shape[1]
+            page_size = dst_kv_cache_layer_shape[2]
+            dst_kv_cache_layer = dst_kv_cache_layer.reshape(2, num_pages * page_size, -1)
+            dst_kv_cache_layer[:, slot_mapping, ...] = src_kv_cache
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        """Inject store-resident KV for each load request into the paged buffer."""
-
-        def inject_kv_into_layer(
-            dst_kv_cache_layer: torch.Tensor,
-            src_kv_cache: torch.Tensor,
-            slot_mapping: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-        ) -> None:
-            # Verbatim from vLLM's ExampleConnector — layout-correct per backend.
-            dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
-            if isinstance(attn_metadata, MLACommonMetadata):
-                num_pages = dst_kv_cache_layer_shape[0]
-                page_size = dst_kv_cache_layer_shape[1]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(num_pages * page_size, -1)
-                dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
-            elif isinstance(attn_metadata, TritonAttentionMetadata):
-                block_idxs = slot_mapping // self._block_size
-                offsets = slot_mapping % self._block_size
-                dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
-            else:
-                num_pages = dst_kv_cache_layer_shape[1]
-                page_size = dst_kv_cache_layer_shape[2]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(2, num_pages * page_size, -1)
-                dst_kv_cache_layer[:, slot_mapping, ...] = src_kv_cache
-
+        """Kick off **layer-wise overlapped** loads: prefetch each layer's KV on a
+        background thread so the forward pass can compute layer i while layer i+1's
+        KV is still being fetched. Injection happens per layer in
+        `wait_for_layer_load`, which blocks only on *that* layer — so KV load hides
+        behind compute instead of being one synchronous barrier before the pass.
+        Mirrors `slice_pool::run_layers_with_notify` on the Rust transfer side."""
+        self._pending_layer_loads = {}
+        self._load_forward_context = forward_context
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, QuillCacheConnectorMetadata)
         n_load = sum(1 for r in metadata.requests if not r.is_store)
         attn_metadata = forward_context.attn_metadata
+        self._load_attn_metadata = attn_metadata
         if attn_metadata is None:
             if n_load:
                 logger.warning(
@@ -345,32 +371,52 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     n_load,
                 )
             return
+        if self._load_executor is None:  # scheduler-side connector never loads bytes
+            return
 
+        # Submit one prefetch per (load request, attention layer). They run on the
+        # background fetch thread while this forward pass proceeds; each is awaited
+        # just-in-time in wait_for_layer_load.
         for request in metadata.requests:
             if request.is_store:
                 continue
             logger.warning(
-                "QC loading %d tokens of KV from the store (%s)",
+                "QC layer-wise loading %d tokens of KV from the store (%s)",
                 len(request.slot_mapping),
                 request.key_prefix,
             )
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
-                kv_cache_layer = getattr(layer, "kv_cache", None)
-                if kv_cache_layer is None:
+                if getattr(layer, "kv_cache", None) is None:
                     continue  # skip non-attention layers (MLP/MoE)
-                buf = self._get_bytes(self._layer_key(request.key_prefix, layer_name))
-                if buf is None:
-                    continue  # miss / evicted / refused — vLLM recomputes this layer
-                kv_cache = self._deserialize(buf, str(kv_cache_layer.device))
-                if isinstance(attn_metadata, dict):
-                    inject_kv_into_layer(
-                        kv_cache_layer, kv_cache, request.slot_mapping, attn_metadata[layer_name]
-                    )
+                key = self._layer_key(request.key_prefix, layer_name)
+                fut = self._load_executor.submit(self._get_bytes, key)
+                self._pending_layer_loads.setdefault(layer_name, []).append((request, fut))
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # Synchronous loads (above) — nothing to await per layer.
-        return
+        """Block until *this* layer's prefetch lands, then inject it — vLLM calls this
+        right before the layer is computed, so earlier layers already overlapped their
+        fetch with compute. Blocks on one layer, not the whole blob."""
+        pending = self._pending_layer_loads.pop(layer_name, None)
+        if not pending:
+            return
+        forward_context = self._load_forward_context
+        attn_metadata = self._load_attn_metadata
+        # Preserve the original behaviour: only the dict-metadata path injects.
+        if forward_context is None or not isinstance(attn_metadata, dict):
+            return
+        layer = forward_context.no_compile_layers.get(layer_name)
+        kv_cache_layer = getattr(layer, "kv_cache", None) if layer is not None else None
+        if kv_cache_layer is None:
+            return
+        for request, fut in pending:
+            buf = fut.result()  # blocks ONLY on this layer's fetch
+            if buf is None:
+                continue  # miss / evicted / refused — vLLM recomputes this layer
+            kv_cache = self._deserialize(buf, str(kv_cache_layer.device))
+            self._inject_kv_into_layer(
+                kv_cache_layer, kv_cache, request.slot_mapping, attn_metadata[layer_name]
+            )
 
     def save_kv_layer(
         self,

@@ -26,6 +26,11 @@ attention.
   (the Dynamo KV-router cost function), governs reuse, and meters SLO, backed by a
   persistent residency index.
 
+The active design line is a **KV-cache-centric co-scheduler**: a cluster-level
+controller that jointly tunes prefill/decode capacity, HBM cache split, hot-prefix
+replication, tier placement, and transfer depth to maximize SLO goodput. See
+[`docs/co-scheduler-design.md`](docs/co-scheduler-design.md).
+
 ## Architecture
 
 ```mermaid
@@ -79,6 +84,17 @@ differentiation on top:
 The two index backends (`index_holt`, `index_rocksdb`) are **feature-gated modules
 inside `quillcache-core`**, off by default — `holt` is pure Rust; `rocksdb` pulls a
 C++/libclang toolchain — so the default build needs neither.
+
+## Design docs
+
+- [`docs/co-scheduler-design.md`](docs/co-scheduler-design.md) — cluster-level
+  KV-cache-centric co-scheduler: SLO goodput, P/D ratio, HBM split, replication,
+  transfer depth, and layer-wise overlap.
+- [`docs/transfer-line-design.md`](docs/transfer-line-design.md) — high-performance
+  KV transfer line: NIXL/UCX selection, topology-aware GDR, layer-wise overlap.
+- [`docs/references.md`](docs/references.md) — papers and systems this design
+  maps to: Mooncake, DistServe, Dynamo/NIXL, MegaScale-Infer, Flux, Comet, CXL KV,
+  Tutti, InstInfer, LMCache, and prompt-leakage work.
 
 ## Status — wired online vs tested unit vs reserved
 
